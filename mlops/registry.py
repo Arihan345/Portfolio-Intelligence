@@ -137,6 +137,11 @@ def get_model_info(model_name: str = MODEL_NAME, alias_or_version: str = PRODUCT
         "feature_version_hash": params.get("feature_version_hash"),
         "training_timestamp_utc": params.get("training_timestamp_utc"),
         "metrics": {k: v for k, v in metrics.items() if not k.startswith("feature_importance_")},
+        "feature_importances": {
+            k[len("feature_importance_"):]: v
+            for k, v in metrics.items()
+            if k.startswith("feature_importance_")
+        },
         "promotion_status": mv.tags.get("promotion_status"),
         "promotion_reason": mv.tags.get("promotion_reason"),
     }

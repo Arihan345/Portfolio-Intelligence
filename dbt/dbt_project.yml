@@ -8,10 +8,21 @@ model-paths: ["models"]
 test-paths: ["tests"]
 macro-paths: ["macros"]
 
-target-path: "target"
+# target-path and packages-install-path point outside this repo's
+# Desktop-synced directory (~/.dbt-build/) rather than inside it. iCloud
+# Drive has repeatedly created sync-conflict duplicate folders here
+# (e.g. "dbt_utils 2") for any real directory dbt writes into
+# frequently, breaking `dbt deps`/`dbt build` -- see this project's
+# other iCloud-avoidance choices (.venv, mlflow store) for the same
+# root cause. dbt_packages can't just be a symlink instead: `dbt deps`
+# does `shutil.rmtree` on it directly, which Python refuses on a
+# symlink -- so the real fix is telling dbt to manage a real directory
+# that already lives outside iCloud's reach.
+target-path: "/Users/arihan/.dbt-build/portfolio-analysis/target"
+packages-install-path: "/Users/arihan/.dbt-build/portfolio-analysis/dbt_packages"
 clean-targets:
-  - "target"
-  - "dbt_packages"
+  - "/Users/arihan/.dbt-build/portfolio-analysis/target"
+  - "/Users/arihan/.dbt-build/portfolio-analysis/dbt_packages"
 
 models:
   portfolio_intelligence:
