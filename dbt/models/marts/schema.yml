@@ -1,0 +1,116 @@
+version: 2
+
+models:
+  - name: mart_portfolio_performance
+    description: >
+      One row per portfolio per day: NAV, cash balance, daily and
+      compounded cumulative return. The primary source for the
+      Streamlit/Power BI portfolio performance chart. TWR/XIRR are not
+      yet computed -- see the model's TODO.
+    columns:
+      - name: portfolio_id
+        tests:
+          - not_null
+      - name: value_date
+        tests:
+          - not_null
+      - name: total_nav_inr
+        tests:
+          - not_null
+      - name: cumulative_return
+        description: Compounded return since the portfolio's first tracked day.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [portfolio_id, value_date]
+
+  - name: mart_asset_performance
+    description: >
+      One row per portfolio per asset per day: holding quantity, cost
+      basis, market value (forward-filled last close), unrealized
+      gain/loss. Realized gain/loss per sale is NOT computed here --
+      see the model's TODO (requires tax-lot accounting).
+    columns:
+      - name: portfolio_id
+        tests:
+          - not_null
+      - name: asset_key
+        tests:
+          - not_null
+      - name: ticker
+        tests:
+          - not_null
+      - name: as_of_date
+        tests:
+          - not_null
+      - name: quantity_held
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [portfolio_id, asset_key, as_of_date]
+
+  - name: mart_risk_metrics
+    description: >
+      One row per portfolio per day: trailing 30-day annualized
+      volatility and drawdown from the running peak NAV. Sharpe ratio,
+      VaR and benchmark-relative beta are NOT computed yet -- see the
+      model's TODO (each needs an input this platform doesn't ingest
+      yet: a risk-free rate series, the Monte Carlo engine, or real
+      benchmark data respectively).
+    columns:
+      - name: portfolio_id
+        tests:
+          - not_null
+      - name: value_date
+        tests:
+          - not_null
+      - name: drawdown_from_peak
+        description: Fraction below the running peak NAV to date; 0 at a new peak, negative otherwise.
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                max_value: 0.0001
+                inclusive: true
+
+  - name: mart_allocation
+    description: >
+      One row per portfolio per asset per day: market value and %
+      weight of that asset within the portfolio's total value that day.
+    columns:
+      - name: portfolio_id
+        tests:
+          - not_null
+      - name: asset_key
+        tests:
+          - not_null
+      - name: as_of_date
+        tests:
+          - not_null
+      - name: weight_in_portfolio
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1.0001
+                inclusive: true
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [portfolio_id, asset_key, as_of_date]
+
+  - name: mart_benchmark
+    description: >
+      One row per portfolio per day comparing portfolio return to a
+      benchmark index return. Currently returns ZERO rows: no
+      benchmark index has been ingested into the warehouse yet (no
+      dim_asset row with asset_type = 'INDEX'). This is a deliberate
+      structural stub, not a bug -- see the model's header comment.
+    columns:
+      - name: portfolio_id
+      - name: value_date
+      - name: benchmark_daily_return

@@ -1,0 +1,23 @@
+version: 2
+
+sources:
+  - name: warehouse
+    schema: public
+    description: >
+      Phase 3 PostgreSQL star-schema warehouse, loaded by
+      warehouse/load/run_load.py from Phase 2's cleaned ingestion output.
+    tables:
+      - name: fact_transactions
+        description: One row per transaction event (BUY/SELL/DIVIDEND/DEPOSIT/WITHDRAWAL).
+      - name: fact_daily_prices
+        description: One row per asset per trading day (OHLCV).
+      - name: dim_asset
+        description: SCD Type 2 asset dimension; sector/industry embedded, versioned by effective_from/effective_to.
+      - name: dim_date
+        description: Static calendar dimension, one row per day.
+      - name: dim_portfolio
+        description: One row per portfolio.
+      - name: fact_holdings
+        description: Materialized point-in-time holding quantity per portfolio/asset/day.
+      - name: fact_portfolio_value
+        description: Daily mark-to-market portfolio NAV.

@@ -1,0 +1,118 @@
+version: 2
+
+models:
+  - name: stg_transactions
+    description: >
+      One row per transaction event (BUY/SELL/DIVIDEND/DEPOSIT/WITHDRAWAL),
+      1:1 with the warehouse's fact_transactions, with date_key resolved
+      to an actual date. No business logic applied here.
+    columns:
+      - name: transaction_id
+        description: Surrogate key, one per transaction event.
+        tests:
+          - unique
+          - not_null
+      - name: portfolio_id
+        description: FK to the portfolio this transaction belongs to.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: source('warehouse', 'dim_portfolio')
+                field: portfolio_id
+      - name: asset_key
+        description: FK to the SCD2 asset dimension version active at transaction time.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: source('warehouse', 'dim_asset')
+                field: asset_key
+      - name: txn_date
+        description: Calendar date the transaction occurred on.
+        tests:
+          - not_null
+      - name: transaction_type
+        description: One of BUY, SELL, DIVIDEND, DEPOSIT, WITHDRAWAL.
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['BUY', 'SELL', 'DIVIDEND', 'DEPOSIT', 'WITHDRAWAL']
+      - name: quantity
+        description: Units transacted. 0 for DIVIDEND/DEPOSIT/WITHDRAWAL rows, > 0 for BUY/SELL.
+        tests:
+          - not_null
+      - name: price
+        description: >
+          Transaction price. For BUY/SELL this is the per-share trade
+          price; for DIVIDEND it is the dividend amount, NOT a share
+          price -- see int_daily_holdings/int_cash_flow for why these
+          are never mixed in the same calculation.
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+      - name: fees
+        tests:
+          - not_null
+      - name: tax
+        tests:
+          - not_null
+
+  - name: stg_prices
+    description: >
+      One row per asset per trading day, 1:1 with fact_daily_prices,
+      with date_key resolved to an actual date.
+    columns:
+      - name: asset_key
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: source('warehouse', 'dim_asset')
+                field: asset_key
+      - name: price_date
+        tests:
+          - not_null
+      - name: close
+        description: Closing price for the trading day.
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: false
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [asset_key, price_date]
+
+  - name: stg_assets
+    description: >
+      One row per asset per SCD2 version, 1:1 with dim_asset. A single
+      ticker may appear multiple times if its sector/industry was
+      reclassified; exactly one row per ticker has is_current = true.
+    columns:
+      - name: asset_key
+        description: Surrogate key, one per SCD2 version row.
+        tests:
+          - unique
+          - not_null
+      - name: ticker
+        description: Natural key, stable across SCD2 versions.
+        tests:
+          - not_null
+      - name: asset_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['EQUITY', 'INDEX']
+      - name: effective_from
+        tests:
+          - not_null
+      - name: effective_to
+        tests:
+          - not_null

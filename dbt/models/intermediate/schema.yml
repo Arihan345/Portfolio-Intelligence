@@ -1,0 +1,102 @@
+version: 2
+
+models:
+  - name: int_daily_holdings
+    description: >
+      One row per (portfolio, asset, day) between that asset's first
+      transaction and today. quantity_held is the running position
+      computed by cumulative-summing signed BUY(+)/SELL(-) quantity,
+      chronologically per asset. Verified against the project's worked
+      example: 10 TCS.NS from 2024-01-01, dropping to 7 from
+      2024-06-01 onward (after the 3-share sale); 5 RELIANCE.NS from
+      2024-02-01 onward.
+    columns:
+      - name: portfolio_id
+        tests:
+          - not_null
+      - name: asset_key
+        tests:
+          - not_null
+      - name: as_of_date
+        tests:
+          - not_null
+      - name: quantity_held
+        description: Point-in-time held quantity as of as_of_date's close.
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1000000
+                inclusive: true
+      - name: cost_basis_inr
+        description: Running remaining cost basis (weighted-average, not tax-lot) for the held quantity.
+        tests:
+          - not_null
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [portfolio_id, asset_key, as_of_date]
+
+  - name: int_cash_flow
+    description: >
+      One row per portfolio per day: cash effect of transactions NOT
+      already reflected in holdings market value (SELL proceeds,
+      DIVIDEND, DEPOSIT, WITHDRAWAL). BUY has zero net effect by
+      convention (assumed externally funded at time of purchase) --
+      see the model's own header comment for the reasoning.
+    columns:
+      - name: portfolio_id
+        tests:
+          - not_null
+      - name: txn_date
+        tests:
+          - not_null
+      - name: cash_delta
+        tests:
+          - not_null
+
+  - name: int_portfolio_value
+    description: >
+      One row per portfolio per day: corrected total NAV = holdings
+      market value (last known close, forward-filled across
+      non-trading days) + running cash balance from int_cash_flow.
+      Fixes a bug in the warehouse's raw fact_portfolio_value, which
+      has no cash leg and shows a fake ~-25% one-day "loss" on any day
+      a SELL occurs.
+    columns:
+      - name: portfolio_id
+        tests:
+          - not_null
+      - name: value_date
+        tests:
+          - not_null
+      - name: holdings_market_value_inr
+        tests:
+          - not_null
+      - name: total_nav_inr
+        tests:
+          - not_null
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [portfolio_id, value_date]
+
+  - name: int_portfolio_returns
+    description: >
+      One row per portfolio per day: simple daily return computed from
+      day-over-day change in int_portfolio_value.total_nav_inr. Not
+      cash-flow-weighted (see mart_portfolio_performance's TODO for
+      TWR/XIRR).
+    columns:
+      - name: portfolio_id
+        tests:
+          - not_null
+      - name: value_date
+        tests:
+          - not_null
+      - name: total_nav_inr
+        tests:
+          - not_null
+      - name: daily_return
+        description: Null on the first day of a portfolio's history (no prior NAV to compare against).
