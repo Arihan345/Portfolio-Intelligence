@@ -20,6 +20,8 @@ class BetaAlpha(BaseModel):
 
 class RiskResponse(BaseModel):
     portfolio_id: int
+    window_start: date
+    window_end: date
     risk_free_rate_annual: float
     var_confidence: float
     annualized_volatility: float

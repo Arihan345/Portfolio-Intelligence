@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 from pydantic import BaseModel
 
@@ -46,3 +46,25 @@ class PortfolioOverviewResponse(BaseModel):
     absolute_return: float
     pct_return: float
     holdings: list[HoldingWeight]
+
+
+class PortfolioSummary(BaseModel):
+    """One row in the portfolio switcher/picker -- enough to identify
+    and distinguish saved portfolios without fetching each one's full
+    overview. market_value/holdings_count are null for a portfolio
+    that uploaded but has no analytics yet (e.g. every row rejected)."""
+
+    portfolio_id: int
+    name: str
+    created_at: datetime
+    market_value: float | None
+    holdings_count: int | None
+
+
+class PortfolioListResponse(BaseModel):
+    portfolios: list[PortfolioSummary]
+
+
+class DeletePortfolioResponse(BaseModel):
+    portfolio_id: int
+    deleted: bool

@@ -21,6 +21,72 @@ DB_URL = "postgresql+psycopg://arihan@localhost:5432/portfolio_analytics"
 
 engine = sa.create_engine(DB_URL)
 
+# The only real user this project has (see warehouse/sql/
+# 04_seed_reference.sql) -- there is no auth system, so every portfolio
+# a real upload creates belongs to this same account.
+DEFAULT_USER_ID = 1
+
+
+def create_portfolio(name: str, base_currency_code: str = "INR") -> int:
+    """Inserts a new dim_portfolio row and returns its portfolio_id.
+
+    dim_portfolio's original seed (04_seed_reference.sql) inserted
+    portfolio_id=1 with an EXPLICIT literal, never through nextval() --
+    so the sequence's own counter never advanced past its default
+    starting position. A plain INSERT ... DEFAULT here relies on
+    nextval() to pick the new row's id, which single-portfolio-app code
+    elsewhere in this project already worked around per-call (see
+    warehouse/tests/test_upload_replace_and_netting.py's test_portfolio_id
+    fixture); advancing the sequence to the real current max once here,
+    every time, is a cheap, idempotent guard against that same
+    collision recurring for a genuinely new portfolio.
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "SELECT setval('dim_portfolio_portfolio_id_seq', "
+                "(SELECT COALESCE(MAX(portfolio_id), 1) FROM dim_portfolio))"
+            )
+        )
+        return conn.execute(
+            sa.text(
+                "INSERT INTO dim_portfolio (user_id, portfolio_name, base_currency_code) "
+                "VALUES (:user_id, :name, :currency) RETURNING portfolio_id"
+            ),
+            {"user_id": DEFAULT_USER_ID, "name": name, "currency": base_currency_code},
+        ).scalar_one()
+
+
+def delete_portfolio(portfolio_id: int) -> bool:
+    """Deletes a saved portfolio and every fact row scoped to it.
+    Returns False if the portfolio_id didn't exist (nothing to delete).
+
+    Deletes child fact tables before dim_portfolio itself (all four
+    have an FK constraint on portfolio_id -- see warehouse/sql/
+    02_facts.sql). Doesn't touch dim_asset/fact_daily_prices, which are
+    asset-level, not portfolio-scoped, and may be shared with other
+    saved portfolios holding the same real ticker.
+
+    This does NOT also clean the dbt-materialized mart_* tables (plain
+    physical tables, not views) -- those still show this portfolio's
+    now-orphaned rows until the next `dbt build`. Callers that need the
+    marts consistent immediately after a delete (e.g. the API's DELETE
+    endpoint, so a deleted portfolio doesn't linger in GET /portfolios'
+    summary stats) must trigger a rebuild themselves, the same way
+    upload already does.
+    """
+    with engine.begin() as conn:
+        exists = conn.execute(
+            sa.text("SELECT 1 FROM dim_portfolio WHERE portfolio_id = :pid"), {"pid": portfolio_id}
+        ).fetchone()
+        if not exists:
+            return False
+        _lock_portfolio_recompute(conn, portfolio_id)
+        for table in ("fact_holdings", "fact_portfolio_value", "fact_portfolio_returns", "fact_transactions"):
+            conn.execute(sa.text(f"DELETE FROM {table} WHERE portfolio_id = :pid"), {"pid": portfolio_id})
+        conn.execute(sa.text("DELETE FROM dim_portfolio WHERE portfolio_id = :pid"), {"pid": portfolio_id})
+        return True
+
 
 def start_pipeline_run(dag_id: str) -> str:
     run_id = str(uuid.uuid4())

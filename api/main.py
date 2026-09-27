@@ -13,6 +13,7 @@ from api.routers import forecast, model, monte_carlo, pipeline, portfolio
 app = FastAPI(title="Portfolio Intelligence API")
 
 app.include_router(portfolio.router)
+app.include_router(portfolio.portfolios_router)
 app.include_router(monte_carlo.router)
 app.include_router(forecast.router)
 app.include_router(model.router)

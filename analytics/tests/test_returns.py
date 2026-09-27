@@ -9,6 +9,7 @@ from analytics.performance.returns import (
     cagr,
     capital_summary,
     daily_returns_from_value_and_flows,
+    implied_market_value_cash_flows_by_day,
     net_external_cash_flows_by_day,
     periodic_returns,
     realized_pnl_summary,
@@ -223,6 +224,116 @@ def test_realized_pnl_summary_nets_cross_exchange_pair():
     realized = realized_pnl_summary(tx)
     assert realized.realized_pnl == pytest.approx(100.0)
     assert realized.total_capital_deployed == pytest.approx(500.0)
+
+
+def test_implied_market_value_cash_flows_credits_first_ever_buy():
+    # Regression for a real, confirmed bug: groupby("ticker").shift(1)
+    # correctly has no prior row on a ticker's own first-ever date (the
+    # asset didn't exist before its first transaction), but leaving
+    # that NaN unfilled made qty_delta also NaN there, and
+    # NaN.abs() > 1e-9 is always False -- silently crediting a brand
+    # new position's real first BUY as a ZERO cash flow instead of its
+    # real cost. Confirmed for real: a portfolio's first-ever purchase
+    # of a new ticker (a single INR 15,117 DIXON.NS share) was credited
+    # as INR 0, making that day's holdings-value jump read as pure,
+    # uncosted gain -- inflating a real portfolio's TWR from ~38% to a
+    # nonsensical ~11,659%, since EVERY ticker's first buy hit this.
+    ap = pd.DataFrame(
+        {
+            "ticker": ["X.NS"],
+            "as_of_date": pd.to_datetime(["2024-01-01"]),
+            "quantity_held": [10.0],
+            "market_value_inr": [1000.0],
+        }
+    )
+    cf = implied_market_value_cash_flows_by_day(ap)
+    assert cf[pd.Timestamp("2024-01-01")] == pytest.approx(1000.0)
+
+
+def test_implied_market_value_cash_flows_handles_price_basis_mismatch():
+    # Regression for a real, confirmed bug: a synthetic test portfolio
+    # used a ticker string ("BETA.NS") that coincidentally has its own
+    # REAL yfinance listing at a real price (~INR 705/share) utterly
+    # unrelated to the fixture's fictional ~INR 58/share sale price.
+    # net_external_cash_flows_by_day (transaction-price-based) valued
+    # the exit's cash flow at the fictional price while holdings_value
+    # (market_value_inr) was priced at the real close -- a ~13x
+    # mismatch that produced a fake -92% single-day "return" on the
+    # exit day alone. implied_market_value_cash_flows_by_day instead
+    # derives the flow from the SAME real-price basis as the value
+    # series, so a full exit's cash flow exactly equals the prior day's
+    # real market value regardless of what the original trade's own
+    # recorded price was -- giving a clean ~0% return on the exit day.
+    ap = pd.DataFrame(
+        {
+            "ticker": ["BETA.NS", "BETA.NS"],
+            "as_of_date": pd.to_datetime(["2023-05-09", "2023-05-10"]),
+            "quantity_held": [5.25, 0.0],
+            "market_value_inr": [3701.25, 0.0],
+        }
+    )
+    cf = implied_market_value_cash_flows_by_day(ap)
+    assert cf[pd.Timestamp("2023-05-10")] == pytest.approx(-3701.25)
+
+    daily = daily_returns_from_value_and_flows(
+        pd.Series([3701.25, 0.0], index=pd.to_datetime(["2023-05-09", "2023-05-10"])), cf
+    )
+    assert daily.loc[pd.Timestamp("2023-05-10")] == pytest.approx(0.0)
+
+
+def test_twr_cagr_correct_sign_across_three_staggered_full_exits():
+    # Regression for the exact real bug class this fixes, using the
+    # same shape as the synthetic ALPHA/BETA/GAMMA fixture (three
+    # positions, each independently bought then fully exited on a
+    # different date) but with a clean, self-manufactured asset-
+    # performance series (no live yfinance dependency, so this test is
+    # deterministic) -- a real net profit across the whole history must
+    # never compute to a negative CAGR/TWR, regardless of how many
+    # separate full-exit transitions the portfolio went through.
+    dates = pd.to_datetime(
+        ["2023-01-01", "2023-01-02", "2023-01-03", "2023-01-04", "2023-01-05", "2023-01-06"]
+    )
+    # Day1: buy A (cost 1000). Day2: buy B (cost 500) alongside A's
+    # normal price growth. Day3: A fully exits at a real profit.
+    # Day4: normal day. Day5: buy C (cost 300). Day6: B and C both
+    # fully exit at a real profit -- three staggered full exits, a
+    # real net profit throughout.
+    ap = pd.DataFrame(
+        {
+            "ticker": (
+                ["A"] * 6
+                + ["B"] * 5
+                + ["C"] * 2
+            ),
+            "as_of_date": (
+                list(dates)
+                + list(dates[1:])
+                + list(dates[4:])
+            ),
+            "quantity_held": (
+                [10, 10, 0, 0, 0, 0]
+                + [5, 5, 5, 5, 0]
+                + [3, 0]
+            ),
+            "market_value_inr": (
+                [1000, 1050, 0, 0, 0, 0]
+                + [500, 520, 520, 520, 0]
+                + [300, 330]
+            ),
+        }
+    )
+    cf = implied_market_value_cash_flows_by_day(ap)
+    holdings_value = ap.groupby("as_of_date")["market_value_inr"].sum().sort_index()
+
+    twr = time_weighted_return(holdings_value, cf)
+    days = (holdings_value.index[-1] - holdings_value.index[0]).days
+    cagr_value = annualize_return(twr, days)
+
+    # Real net profit: A exits at 1050 (cost 1000, +50), B exits at 520
+    # (cost 500, +20), C exits at 330 (cost 300, +30) -- a real,
+    # unambiguous net gain across the whole history.
+    assert twr > 0, f"TWR must be positive for a real net profit, got {twr}"
+    assert cagr_value > 0, f"CAGR must be positive for a real net profit, got {cagr_value}"
 
 
 def test_xirr_hand_case_single_period():

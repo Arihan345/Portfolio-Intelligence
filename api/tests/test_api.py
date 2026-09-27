@@ -136,8 +136,17 @@ def _latest_asset_performance():
 # --------------------------- upload ---------------------------
 
 def test_upload_real_example_csv_runs_full_pipeline():
+    # Explicit portfolio_id=1: this whole module's fixture (see
+    # _restore_portfolio_1_after_module above) snapshots/restores THAT
+    # portfolio specifically, and every other test in this module
+    # asserts against PORTFOLIO_ID=1's data. Multi-portfolio uploads
+    # now default to CREATING a new portfolio when portfolio_id is
+    # omitted (see upload_portfolio's own docstring) -- this test needs
+    # the original REPLACE behavior, not a new, disconnected portfolio.
     with open("ingestion/tests/test_portfolio.csv", "rb") as f:
-        r = client.post("/portfolio/upload", files={"file": ("test_portfolio.csv", f, "text/csv")})
+        r = client.post(
+            "/portfolio/upload", params={"portfolio_id": PORTFOLIO_ID}, files={"file": ("test_portfolio.csv", f, "text/csv")}
+        )
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "SUCCESS"
@@ -228,6 +237,42 @@ def test_risk_endpoint_returns_real_values_and_respects_query_params():
 def test_risk_invalid_portfolio_returns_404():
     r = client.get("/portfolio/999999/risk")
     assert r.status_code == 404
+
+
+def test_risk_correlation_matrix_scoped_to_current_holdings_only():
+    # Regression for a real, confirmed bug: this endpoint used to pivot
+    # mart_asset_performance UNFILTERED (every ticker ever traded) for
+    # its correlation matrix and mart_portfolio_performance's full
+    # historical NAV path (including every exited position's own
+    # volatility while it was held) for Sharpe/volatility/VaR/max
+    # drawdown -- a real portfolio's correlation matrix showed
+    # ALOKINDS.NS/BAJAJHFL.NS/DIXON.NS/etc. (long-exited positions, NOT
+    # the real current holdings) and annualized volatility came out at
+    # an implausible 245%+. Attribution is CORRECT to include exited
+    # positions within its own historical window by design (a
+    # genuinely different question -- "what contributed to return over
+    # this period" vs. Risk's "how risky is what I own right now") --
+    # this test asserts Risk's scope, specifically, always matches
+    # current holdings, distinct from Attribution's intentionally wider
+    # scope, so this doesn't silently regress a third time.
+    r = client.get(f"/portfolio/{PORTFOLIO_ID}/risk")
+    assert r.status_code == 200
+    body = r.json()
+    correlation_tickers = set(body["correlation_matrix"].keys()) - {"NIFTY50"}
+
+    latest = _latest_asset_performance()
+    current_holdings = set(latest.loc[latest["quantity_held"] > 1e-9, "ticker"])
+
+    assert current_holdings, "test fixture must have real current holdings for this assertion to be meaningful"
+    assert correlation_tickers == current_holdings, (
+        f"Risk's correlation matrix must be scoped to exactly the current holdings {current_holdings}, "
+        f"got {correlation_tickers}"
+    )
+
+    # A plausibility guard against the same class of inflation bug:
+    # real diversified-equity annualized volatility is never anywhere
+    # near the confirmed-bad 245%+ this bug produced.
+    assert 0 < body["annualized_volatility"] < 1.5
 
 
 # --------------------------- benchmark ---------------------------

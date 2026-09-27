@@ -12,9 +12,11 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+import sqlalchemy as sa
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
 
 from analytics import data_access as da
+from analytics.data_access import engine
 from analytics.allocation.allocation import (
     asset_allocation,
     cash_allocation,
@@ -29,7 +31,7 @@ from analytics.performance.returns import (
     cagr,
     capital_summary,
     daily_returns_from_value_and_flows,
-    net_external_cash_flows_by_day,
+    implied_market_value_cash_flows_by_day,
     periodic_returns,
     realized_pnl_summary,
     rolling_returns,
@@ -48,12 +50,15 @@ from analytics.risk.risk import (
     sharpe_ratio,
     sortino_ratio,
 )
+from forecasting.arima.series import build_extended_portfolio_series
 from ingestion.cleaning import clean_and_standardize
 from ingestion.portfolio_validation import TICKER_PATTERN, validate_csv
 from ingestion.providers.yfinance_provider import YFinanceProvider
 from warehouse.load.load_benchmark import BENCHMARK_TICKER, upsert_benchmark_asset
 from warehouse.load.load_warehouse import (
+    create_portfolio,
     dbt_build_lock,
+    delete_portfolio,
     derive_fact_holdings,
     derive_fact_portfolio_returns,
     derive_fact_portfolio_value,
@@ -72,8 +77,11 @@ from api.schemas.benchmark import BenchmarkResponse
 from api.schemas.performance import CapitalSummary, PerformanceResponse
 from api.schemas.portfolio import (
     DataQualityReportResponse,
+    DeletePortfolioResponse,
     HoldingWeight,
+    PortfolioListResponse,
     PortfolioOverviewResponse,
+    PortfolioSummary,
     RejectedRow,
     UploadResponse,
 )
@@ -81,7 +89,12 @@ from api.schemas.risk import BetaAlpha, MaxDrawdown, RiskResponse
 
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 
-DEFAULT_PORTFOLIO_ID = 1
+# GET /portfolios (plural, no {id}) doesn't fit under router's own
+# "/portfolio" prefix -- APIRouter always prepends its prefix to every
+# route registered on it, with no per-route override -- so it lives on
+# this second, unprefixed router instead. Both are registered in
+# api/main.py.
+portfolios_router = APIRouter(tags=["portfolio"])
 
 # Ticker suffix -> exchange, per the same .NS/.BO convention
 # ingestion/portfolio_validation.py's TICKER_PATTERN already requires.
@@ -196,10 +209,27 @@ def _build_asset_meta(tickers: list[str]) -> dict[str, dict]:
 
 
 @router.post("/upload", response_model=UploadResponse)
-def upload_portfolio(file: UploadFile) -> UploadResponse:
+def upload_portfolio(
+    file: UploadFile,
+    portfolio_id: int | None = Query(
+        None, description="Replace this EXISTING portfolio's data instead of creating a new one."
+    ),
+    name: str | None = Query(None, description="Display name for a newly-created portfolio."),
+) -> UploadResponse:
     """Runs the full existing pipeline: Phase 2 validate -> clean -> Phase
     3 warehouse load -> Phase 4 dbt rebuild. Returns the same
     DataQualityReport shape Phase 2 already defines.
+
+    Multi-portfolio behavior: omitting `portfolio_id` CREATES a new
+    saved portfolio (this is the default -- uploading no longer always
+    overwrites portfolio_id=1, a real, deliberate change from this
+    project's original single-portfolio design). Passing an existing
+    `portfolio_id` instead REPLACES that portfolio's data in place
+    (the original behavior, still needed for "re-upload a corrected
+    CSV for the same portfolio" without spawning a duplicate). Passing
+    a `portfolio_id` that doesn't exist yet is a 404, not a silent
+    create -- an explicit id is a claim about an existing portfolio,
+    never a request to pick that id for a new one.
 
     Declared as a plain `def`, not `async def`: this function's real
     work (pandas, psycopg, a blocking dbt subprocess) has no `await`
@@ -214,6 +244,9 @@ def upload_portfolio(file: UploadFile) -> UploadResponse:
     depends on (see _lock_portfolio_recompute in
     warehouse/load/load_warehouse.py) rather than masking it.
     """
+    if portfolio_id is not None:
+        get_portfolio_or_404(portfolio_id)
+
     contents = file.file.read()
     with tempfile.NamedTemporaryFile(mode="wb", suffix=".csv", delete=False) as tmp:
         tmp.write(contents)
@@ -275,6 +308,19 @@ def upload_portfolio(file: UploadFile) -> UploadResponse:
         if ticker_correction_notes:
             dq_report.notes = [f"[ticker-corrected] {n}" for n in ticker_correction_notes] + dq_report.notes
 
+        # Portfolio creation happens HERE, after validation/cleaning
+        # succeeded -- not up front -- so a malformed or unreadable CSV
+        # (rejected above with a 422) never leaves an orphaned, empty
+        # new portfolio behind. See this function's own docstring for
+        # the create-vs-replace semantics `portfolio_id` selects.
+        if portfolio_id is not None:
+            target_portfolio_id = portfolio_id
+            created_new_portfolio = False
+        else:
+            default_name = name or file.filename or f"Portfolio ({date.today().isoformat()})"
+            target_portfolio_id = create_portfolio(default_name)
+            created_new_portfolio = True
+
         run_id = start_pipeline_run(dag_id="api_upload")
         total_rows = 0
         try:
@@ -322,7 +368,7 @@ def upload_portfolio(file: UploadFile) -> UploadResponse:
             # upsert_dim_asset's docstring).
             asset_keys = upsert_dim_asset(asset_meta, start_d, "api_upload", run_id) if start_d is not None else {}
 
-            n = load_fact_transactions(cleaned, DEFAULT_PORTFOLIO_ID, "api_upload", run_id)
+            n = load_fact_transactions(cleaned, target_portfolio_id, "api_upload", run_id)
             total_rows += n
 
             if not cleaned.empty:
@@ -352,9 +398,9 @@ def upload_portfolio(file: UploadFile) -> UploadResponse:
                 n = load_fact_daily_prices(benchmark_ohlcv.data, "api_upload", run_id)
                 total_rows += n
 
-            derive_fact_holdings(DEFAULT_PORTFOLIO_ID, "api_upload", run_id)
-            derive_fact_portfolio_value(DEFAULT_PORTFOLIO_ID, "api_upload", run_id)
-            derive_fact_portfolio_returns(DEFAULT_PORTFOLIO_ID, "api_upload", run_id)
+            derive_fact_holdings(target_portfolio_id, "api_upload", run_id)
+            derive_fact_portfolio_value(target_portfolio_id, "api_upload", run_id)
+            derive_fact_portfolio_returns(target_portfolio_id, "api_upload", run_id)
 
             dbt_script = Path(__file__).resolve().parents[2] / "dbt" / "run_dbt.sh"
             # dbt's own table-swap materialization isn't safe for
@@ -378,10 +424,18 @@ def upload_portfolio(file: UploadFile) -> UploadResponse:
             # since it made distinguishing "known dbt/env hiccup" from
             # "new concurrency bug" impossible without terminal scrollback).
             finish_pipeline_run(run_id, "FAILED", total_rows, error_message=f"{type(exc).__name__}: {exc}")
+            if created_new_portfolio:
+                # A freshly-created portfolio whose very first upload
+                # failed shouldn't linger as a broken, empty entry in
+                # GET /portfolios' picker -- there's no prior data on
+                # it worth protecting (unlike replacing an EXISTING
+                # portfolio, where load_fact_transactions deliberately
+                # never wipes on a bad upload).
+                delete_portfolio(target_portfolio_id)
             raise HTTPException(status_code=500, detail=f"pipeline failed: {exc}") from exc
 
         return UploadResponse(
-            portfolio_id=DEFAULT_PORTFOLIO_ID,
+            portfolio_id=target_portfolio_id,
             pipeline_run_id=run_id,
             status=status,
             valid_row_count=len(vresult.valid_rows),
@@ -394,6 +448,87 @@ def upload_portfolio(file: UploadFile) -> UploadResponse:
         )
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+
+@portfolios_router.get("/portfolios", response_model=PortfolioListResponse)
+def list_portfolios() -> PortfolioListResponse:
+    """Every saved portfolio, newest first, with enough summary data
+    for a picker/switcher UI to render without a follow-up request per
+    portfolio. market_value/holdings_count are null for a portfolio
+    with no analytics yet (e.g. it exists but every uploaded row was
+    rejected, or dbt hasn't built its marts yet).
+    """
+    with engine.begin() as conn:
+        rows = conn.execute(
+            sa.text(
+                """
+                SELECT
+                    p.portfolio_id,
+                    p.portfolio_name AS name,
+                    p.created_at,
+                    (
+                        SELECT SUM(m.market_value_inr)
+                        FROM public_marts.mart_asset_performance m
+                        WHERE m.portfolio_id = p.portfolio_id
+                          AND m.as_of_date = (
+                              SELECT MAX(as_of_date) FROM public_marts.mart_asset_performance
+                              WHERE portfolio_id = p.portfolio_id
+                          )
+                    ) AS market_value,
+                    (
+                        SELECT COUNT(*)
+                        FROM public_marts.mart_asset_performance m
+                        WHERE m.portfolio_id = p.portfolio_id
+                          AND m.as_of_date = (
+                              SELECT MAX(as_of_date) FROM public_marts.mart_asset_performance
+                              WHERE portfolio_id = p.portfolio_id
+                          )
+                          AND m.quantity_held > 1e-9
+                    ) AS holdings_count
+                FROM dim_portfolio p
+                ORDER BY p.created_at DESC
+                """
+            )
+        ).mappings().all()
+
+    return PortfolioListResponse(
+        portfolios=[
+            PortfolioSummary(
+                portfolio_id=r["portfolio_id"],
+                name=r["name"],
+                created_at=r["created_at"],
+                market_value=float(r["market_value"]) if r["market_value"] is not None else None,
+                holdings_count=int(r["holdings_count"]) if r["holdings_count"] is not None else None,
+            )
+            for r in rows
+        ]
+    )
+
+
+@router.delete("/{portfolio_id}", response_model=DeletePortfolioResponse)
+def delete_portfolio_endpoint(portfolio_id: int, _: None = Depends(get_portfolio_or_404)) -> DeletePortfolioResponse:
+    """Permanently deletes a saved portfolio and every fact row scoped
+    to it. Destructive and irreversible -- the frontend is responsible
+    for requiring the user to confirm before calling this; this
+    endpoint itself performs the delete unconditionally once called,
+    the same way DELETE endpoints conventionally do.
+    """
+    deleted = delete_portfolio(portfolio_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"portfolio {portfolio_id} not found")
+
+    # The mart_* tables are plain physical tables (dbt TABLE
+    # materialization, not views) -- deleting fact_transactions etc.
+    # above doesn't remove this portfolio's now-orphaned rows from
+    # them. Rebuilding keeps GET /portfolios (which reads directly from
+    # mart_asset_performance) from showing a deleted portfolio's stale
+    # summary stats, and matches the same rebuild-after-fact-change
+    # pattern the upload endpoint already uses.
+    dbt_script = Path(__file__).resolve().parents[2] / "dbt" / "run_dbt.sh"
+    with dbt_build_lock():
+        subprocess.run([str(dbt_script), "build"], capture_output=True, text=True, timeout=300)
+
+    return DeletePortfolioResponse(portfolio_id=portfolio_id, deleted=True)
 
 
 @router.get("/{portfolio_id}/overview", response_model=PortfolioOverviewResponse)
@@ -549,25 +684,78 @@ def get_risk(
     portfolio_id: int,
     risk_free_rate_annual: float = 0.07,
     var_confidence: float = 0.95,
+    start_date: date | None = Query(None, description="Restrict the risk window to this start (inclusive)."),
+    end_date: date | None = Query(None, description="Restrict the risk window to this end (inclusive)."),
     _: None = Depends(get_portfolio_or_404),
 ) -> RiskResponse:
-    pp = da.get_portfolio_performance(portfolio_id).set_index("value_date")
-    if pp.empty:
-        raise HTTPException(status_code=404, detail=f"no risk data for portfolio {portfolio_id}")
-    daily_returns = pp["daily_return"].dropna()
+    # Every metric on this page must reflect only CURRENTLY-HELD
+    # positions -- Risk answers "how risky is what I own right now,"
+    # a genuinely different question from Attribution's "what
+    # contributed to return over a historical window" (which correctly
+    # includes since-exited positions by design). Confirmed real bug:
+    # this endpoint used to build its return series from
+    # mart_portfolio_performance.daily_return/total_nav_inr (the
+    # portfolio's ACTUAL historical NAV path, correctly including every
+    # exited position's own volatility while it was held) and pivot
+    # mart_asset_performance UNFILTERED for the correlation matrix
+    # (every ticker ever traded, not just today's holdings) -- a real
+    # portfolio's correlation matrix showed ALOKINDS.NS/BAJAJHFL.NS/
+    # DIXON.NS/etc. (mostly long-exited positions) instead of the 9
+    # real current holdings, and annualized volatility came out at an
+    # implausible 245%+, inflated by highly volatile exited penny
+    # stocks no longer owned. build_extended_portfolio_series already
+    # builds exactly the right series for this (Monte Carlo's baseline
+    # params and Performance's CAGR/TWR fix both already use it): each
+    # CURRENTLY-HELD ticker's own real price history, weighted at
+    # today's actual allocation -- unifying Risk onto it here removes
+    # the same class of bug from a third place instead of patching this
+    # one spot in isolation.
+    try:
+        series = build_extended_portfolio_series(portfolio_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422, detail=f"risk metrics aren't available for this portfolio right now: {exc}"
+        ) from exc
+
+    # Optional user-selected window (e.g. "Last 3 months" or a custom
+    # range) -- restricts every metric to that slice of the SAME
+    # currently-held-tickers series above, never widening back out to
+    # exited positions just because a narrower date range was picked.
+    # Applied here, before computing any metric, so every downstream
+    # calculation (Sharpe, volatility, VaR, correlation, ...) sees
+    # exactly the same windowed data consistently.
+    if start_date is not None or end_date is not None:
+        lo = pd.Timestamp(start_date) if start_date is not None else series.index[0]
+        hi = pd.Timestamp(end_date) if end_date is not None else series.index[-1]
+        if lo >= hi:
+            raise HTTPException(status_code=422, detail="start_date must be before end_date")
+        series = series.loc[(series.index >= lo) & (series.index <= hi)]
+        if len(series) < 3:
+            raise HTTPException(
+                status_code=422,
+                detail=f"the range {lo.date()} to {hi.date()} has too little real price data to compute risk metrics",
+            )
+
+    daily_returns = series.pct_change().dropna()
 
     bench = da.get_benchmark(portfolio_id).set_index("value_date")
     bench_returns = bench["benchmark_daily_return"].reindex(daily_returns.index)
     ba = beta_alpha(daily_returns, bench_returns, risk_free_rate_annual)
-    mdd = max_drawdown(pp["total_nav_inr"])
+    mdd = max_drawdown(series)
 
     ap = da.get_asset_performance(portfolio_id)
-    wide = ap.pivot(index="as_of_date", columns="ticker", values="market_value_inr").pct_change().dropna(how="all")
+    latest_date = ap["as_of_date"].max()
+    held_tickers = ap.loc[(ap["as_of_date"] == latest_date) & (ap["quantity_held"] > 1e-9), "ticker"]
+    ap_held = ap[ap["ticker"].isin(held_tickers)]
+    wide = ap_held.pivot(index="as_of_date", columns="ticker", values="market_value_inr").pct_change().dropna(how="all")
+    wide = wide.reindex(wide.index.intersection(series.index))
     wide["NIFTY50"] = bench_returns.reindex(wide.index)
     corr = correlation_matrix(wide)
 
     return RiskResponse(
         portfolio_id=portfolio_id,
+        window_start=series.index[0].date(),
+        window_end=series.index[-1].date(),
         risk_free_rate_annual=risk_free_rate_annual,
         var_confidence=var_confidence,
         annualized_volatility=annualized_volatility(daily_returns),
@@ -669,18 +857,56 @@ def _find_stable_composition_window(portfolio_id: int) -> tuple[str, str] | None
 
 
 @router.get("/{portfolio_id}/attribution", response_model=AttributionResponse)
-def get_attribution(portfolio_id: int, _: None = Depends(get_portfolio_or_404)) -> AttributionResponse:
-    window = _find_stable_composition_window(portfolio_id)
-    if window is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"no stable no-trading-activity window available for portfolio {portfolio_id} "
-                "(attribution needs at least 2 trading days with a gap between them to compute "
-                "a real weight x return reconciliation)"
-            ),
-        )
-    window_start, window_end = window
+def get_attribution(
+    portfolio_id: int,
+    start_date: date | None = Query(None, description="Custom window start (inclusive). Requires end_date too."),
+    end_date: date | None = Query(None, description="Custom window end (inclusive). Requires start_date too."),
+    _: None = Depends(get_portfolio_or_404),
+) -> AttributionResponse:
+    if start_date is not None or end_date is not None:
+        if start_date is None or end_date is None:
+            raise HTTPException(status_code=422, detail="start_date and end_date must both be given for a custom window")
+        if start_date >= end_date:
+            raise HTTPException(status_code=422, detail="start_date must be before end_date")
+
+        # Restriction approach (not the weight-change extension): the
+        # weight*return identity below only holds exactly when nothing
+        # was bought/sold mid-window, so a user-picked range containing
+        # a trade is rejected outright with the exact offending date(s)
+        # -- clearer and more honest than silently producing a number
+        # that fails its own reconciliation check, and simpler than
+        # correctly handling a composition that changes partway through
+        # (which _find_stable_composition_window's own docstring
+        # already treats as a real, non-negligible gap, not a detail to
+        # paper over).
+        tx = da.get_transactions(portfolio_id)
+        trade_dates = sorted(tx[tx["transaction_type"].isin(["BUY", "SELL"])]["txn_date"].dt.date.unique())
+        offending = [d for d in trade_dates if start_date < d < end_date]
+        if offending:
+            shown = ", ".join(d.isoformat() for d in offending[:5])
+            more = f", and {len(offending) - 5} more" if len(offending) > 5 else ""
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"the range {start_date} to {end_date} includes {len(offending)} buy/sell "
+                    f"date(s) ({shown}{more}) -- pick a range with no trading activity strictly "
+                    "between the two dates, so every holding's weight stayed constant throughout "
+                    "(the boundary dates themselves are fine)."
+                ),
+            )
+        window_start, window_end = start_date.isoformat(), end_date.isoformat()
+    else:
+        window = _find_stable_composition_window(portfolio_id)
+        if window is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"no stable no-trading-activity window available for portfolio {portfolio_id} "
+                    "(attribution needs at least 2 trading days with a gap between them to compute "
+                    "a real weight x return reconciliation)"
+                ),
+            )
+        window_start, window_end = window
 
     alloc = da.get_allocation(portfolio_id)
     start_alloc = alloc[alloc["as_of_date"] == window_start]

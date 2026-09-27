@@ -276,8 +276,22 @@ def implied_market_value_cash_flows_by_day(asset_performance: pd.DataFrame) -> p
         return pd.Series(dtype=float)
 
     ap = asset_performance.sort_values(["ticker", "as_of_date"]).copy()
-    qty_prev = ap.groupby("ticker")["quantity_held"].shift(1)
-    mv_prev = ap.groupby("ticker")["market_value_inr"].shift(1)
+    # fillna(0), not left as NaN: a ticker's OWN first row in this
+    # DataFrame is its real first-ever transaction date (int_daily_
+    # holdings only generates a calendar from each asset's own start
+    # date onward, never "before it existed") -- shift(1) correctly has
+    # no prior row there, but that means "held zero before this,"
+    # never "unknown." Left as NaN, qty_delta below would also be NaN
+    # on every brand-new position's first day, and NaN.abs() > 1e-9 is
+    # always False -- silently treating a real, sometimes-large first
+    # BUY as a zero cash flow. Confirmed for real: a portfolio's very
+    # first purchase of a new ticker (e.g. a single INR 15,117 DIXON.NS
+    # share) got credited as INR 0 cash flow instead of its real cost,
+    # making that day's holdings-value jump read as pure, uncosted
+    # gain -- inflating TWR from a real ~38% to a nonsensical ~11,659%
+    # across the whole portfolio (every ticker's first buy hit this).
+    qty_prev = ap.groupby("ticker")["quantity_held"].shift(1).fillna(0.0)
+    mv_prev = ap.groupby("ticker")["market_value_inr"].shift(1).fillna(0.0)
 
     qty_delta = ap["quantity_held"] - qty_prev
     price_now = ap["market_value_inr"] / ap["quantity_held"].where(ap["quantity_held"] > 1e-9)
