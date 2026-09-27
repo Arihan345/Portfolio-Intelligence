@@ -11,6 +11,7 @@ import json
 from ml.data.fetch_price_history import load_cached
 from ml.dataset import build_dataset
 from ml.train import train_and_evaluate
+from ml.walk_forward import run_walk_forward_evaluation
 from mlops.config import MODEL_NAME
 from mlops.registry import get_model_info, promote_if_beats_baseline, register_model
 from mlops.tracking import log_training_run
@@ -28,8 +29,19 @@ def main() -> None:
     print(f"Dataset version: {dv.as_dict()}")
     print(f"Feature version hash: {fv}")
 
-    print("\n=== LOGGING TRAINING RUN TO MLFLOW ===")
-    run_id = log_training_run(prices, result)
+    print("\n=== WALK-FORWARD CROSS-VALIDATION (supplementary diagnostic) ===")
+    wf_folds = run_walk_forward_evaluation(dataset, n_folds=5)
+    for f in wf_folds:
+        print(
+            f"fold {f.fold}: train_end={f.train_end} test=[{f.test_start}..{f.test_end}] "
+            f"n_train={f.train_size} n_test={f.test_size} "
+            f"label_rate_train={f.label_rate_train:.3f} label_rate_test={f.label_rate_test:.3f} "
+            f"baseline_f1={f.baseline_f1:.3f} model_f1={f.model_f1:.3f} "
+            f"delta_f1={f.delta_f1:+.3f} beats_baseline={f.model_beats_baseline}"
+        )
+
+    print("\n=== LOGGING TRAINING RUN TO MLFLOW (incl. walk-forward folds) ===")
+    run_id = log_training_run(prices, result, walk_forward_folds=wf_folds)
     print(f"Logged run_id: {run_id}")
     print(f"Baseline metrics logged: {result['baseline_metrics']}")
     print(f"Model metrics logged: {result['model_metrics']}")

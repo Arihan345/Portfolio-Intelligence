@@ -5,9 +5,13 @@ import pandas as pd
 import pytest
 
 from analytics.performance.returns import (
+    annualize_return,
     cagr,
     capital_summary,
+    daily_returns_from_value_and_flows,
+    net_external_cash_flows_by_day,
     periodic_returns,
+    realized_pnl_summary,
     rolling_returns,
     time_weighted_return,
     xirr,
@@ -85,6 +89,140 @@ def test_twr_removes_deposit_distortion():
     flows = pd.Series([100.0], index=[idx[1]])
     result = time_weighted_return(nav, flows)
     assert result == pytest.approx(0.10)
+
+
+def test_twr_cagr_unaffected_by_tiny_denominator_extreme_period():
+    # Regression for a real, confirmed bug: a portfolio's tiny-base
+    # position (bought 2 @ INR 15, sold months later 2 @ INR 45 -- a
+    # 200% move on a ~INR 30 cost basis, the synthetic fixture's
+    # HDFCBANK case at tests/fixtures/synthetic_edge_case_portfolio.csv)
+    # produced a portfolio-level CAGR of 524.95% and TWR of 8681.84%
+    # when daily returns were computed as a naive value(t)/value(t-1)
+    # ratio -- the BUY's and SELL's own SIZE got read as investment
+    # return instead of capital moving in/out. A single extreme-
+    # percentage period on a small denominator must never blow up the
+    # portfolio-level CAGR/TWR once cash flows are correctly backed out.
+    idx = pd.to_datetime(
+        ["2024-01-01", "2024-01-02", "2024-06-01", "2024-06-02", "2026-01-01"]
+    )
+    # Day0: an established, normal-sized base (unrelated holdings).
+    # Day1: BUY 2 HDFCBANK @ 15 = 30 (external inflow, no market move).
+    # Day2 (~5 months later): SELL 2 HDFCBANK @ 45 = 90 net proceeds
+    #   (external outflow) -- the other holdings alone are unchanged.
+    # Day3: normal day, no flows.
+    # Day4 (~2 years out): modest overall growth to 1200.
+    value = pd.Series([1000.0, 1030.0, 1000.0, 1005.0, 1200.0], index=idx)
+    flows = pd.Series([30.0, -90.0], index=[idx[1], idx[2]])
+
+    daily = daily_returns_from_value_and_flows(value, flows).dropna()
+    # Neither trade-adjacent period should be anywhere near the raw 200%
+    # move on HDFCBANK's own tiny position -- each reflects only the
+    # REST of the portfolio's real movement once the flow is backed out.
+    assert daily.loc[idx[1]] == pytest.approx(0.0)  # BUY day: pure inflow, no fake gain
+    assert abs(daily.loc[idx[2]]) < 0.10  # SELL day: no fake loss from cash leaving
+
+    twr = time_weighted_return(value, flows)
+    assert twr < 1.0  # nowhere near the old bug's 86.8184 (8681.84%)
+
+    days = (idx[-1] - idx[0]).days
+    cagr_value = annualize_return(twr, days)
+    assert cagr_value < 1.0  # nowhere near the old bug's 5.2495 (524.95%)
+    assert -0.5 < cagr_value < 1.0  # a plausible multi-year annualized rate
+
+
+def test_net_external_cash_flows_by_day_buy_and_sell_signs():
+    tx = pd.DataFrame(
+        {
+            "txn_date": pd.to_datetime(["2024-01-02", "2024-06-01"]),
+            "transaction_type": ["BUY", "SELL"],
+            "quantity": [2.0, 2.0],
+            "price_inr": [15.0, 45.0],
+            "fees": [0.0, 0.0],
+            "tax": [0.0, 0.0],
+        }
+    )
+    flows = net_external_cash_flows_by_day(tx)
+    assert flows[pd.Timestamp("2024-01-02")] == pytest.approx(30.0)
+    assert flows[pd.Timestamp("2024-06-01")] == pytest.approx(-90.0)
+
+
+def test_capital_summary_fully_exited_portfolio_shows_realized_pnl():
+    # Regression for a real, confirmed bug: a fully-exited synthetic
+    # portfolio (3 tickers, all bought then fully sold: total buys
+    # 2,165, total sells 2,690, a real 525 realized profit) showed
+    # Invested Capital as -525 (net cash received, not a cost basis)
+    # and % Return as a nonsensical -100.00% (absolute_return/0 falling
+    # back to a hardcoded value). With invested_capital correctly at 0
+    # (nothing is currently held) and a realized_summary reflecting the
+    # real trading history, Absolute Return/% Return must reflect the
+    # real 525 profit relative to real capital deployed, not collapse
+    # to 0/NaN or a fake -100%.
+    tx = pd.DataFrame(
+        {
+            "txn_date": pd.to_datetime(
+                ["2023-01-05", "2023-03-05", "2023-02-01", "2023-04-01", "2023-02-15", "2023-05-15"]
+            ),
+            "ticker": ["TCS.NS", "TCS.NS", "INFY.NS", "INFY.NS", "WIPRO.NS", "WIPRO.NS"],
+            "transaction_type": ["BUY", "SELL", "BUY", "SELL", "BUY", "SELL"],
+            "quantity": [5.0, 5.0, 10.0, 10.0, 1.0, 1.0],
+            "price_inr": [100.0, 140.0, 80.0, 100.0, 865.0, 990.0],
+            "fees": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "tax": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        }
+    )
+    realized = realized_pnl_summary(tx)
+    assert realized.realized_pnl == pytest.approx(525.0)
+    assert realized.total_capital_deployed == pytest.approx(2165.0)
+
+    result = capital_summary(invested_capital=0.0, market_value=0.0, realized_summary=realized)
+    assert result["invested_capital"] == 0.0
+    assert result["absolute_return"] == pytest.approx(525.0)
+    assert result["pct_return"] == pytest.approx(525.0 / 2165.0)
+
+
+def test_capital_summary_normal_case_unaffected_by_realized_summary_arg():
+    # A portfolio with real current holdings (invested_capital > 0)
+    # must behave EXACTLY as before -- the realized-P&L fallback only
+    # ever applies in the fully-exited (invested_capital == 0) case, so
+    # the already-validated real-portfolio ground truth (Invested
+    # 15,696 / Market Value 17,372 / Absolute Return 1,675 / 10.67%)
+    # must never be touched by this fix.
+    tx = pd.DataFrame(
+        {
+            "txn_date": pd.to_datetime(["2023-01-05"]),
+            "ticker": ["TCS.NS"],
+            "transaction_type": ["BUY"],
+            "quantity": [5.0],
+            "price_inr": [100.0],
+            "fees": [0.0],
+            "tax": [0.0],
+        }
+    )
+    realized = realized_pnl_summary(tx)
+    result = capital_summary(invested_capital=1000.0, market_value=1200.0, realized_summary=realized)
+    assert result["absolute_return"] == 200.0
+    assert result["pct_return"] == pytest.approx(0.2)
+
+
+def test_realized_pnl_summary_nets_cross_exchange_pair():
+    # Same base-symbol folding convention as int_daily_holdings.sql's
+    # canonical_asset: a BUY on one exchange and a SELL on the other
+    # for the same underlying company must net as one position, not
+    # read as an unmatched, impossible SELL.
+    tx = pd.DataFrame(
+        {
+            "txn_date": pd.to_datetime(["2023-01-01", "2023-02-01"]),
+            "ticker": ["MOREPENLAB.BO", "MOREPENLAB.NS"],
+            "transaction_type": ["BUY", "SELL"],
+            "quantity": [10.0, 10.0],
+            "price_inr": [50.0, 60.0],
+            "fees": [0.0, 0.0],
+            "tax": [0.0, 0.0],
+        }
+    )
+    realized = realized_pnl_summary(tx)
+    assert realized.realized_pnl == pytest.approx(100.0)
+    assert realized.total_capital_deployed == pytest.approx(500.0)
 
 
 def test_xirr_hand_case_single_period():

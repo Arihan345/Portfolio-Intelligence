@@ -33,6 +33,18 @@ models:
         description: Running remaining cost basis (weighted-average, not tax-lot) for the held quantity.
         tests:
           - not_null
+          # Regression for a real, confirmed bug: cost_basis_inr used
+          # to be computed as a running net-cash-flow sum (BUY cost
+          # minus SELL PROCEEDS), which drifts negative the moment
+          # realized profit on a sale exceeds whatever's still held --
+          # confirmed real: a fully-exited portfolio (bought for 2,165
+          # total, sold for 2,690 total) showed a portfolio-level cost
+          # basis of -525. A real weighted-average remaining cost basis
+          # can never be negative -- the worst case is 0 (nothing held).
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
     tests:
       - dbt_utils.unique_combination_of_columns:
           arguments:

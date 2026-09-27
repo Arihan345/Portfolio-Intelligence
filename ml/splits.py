@@ -15,13 +15,28 @@ import numpy as np
 import pandas as pd
 
 
+def train_cutoff_date(dates: pd.Series, train_frac: float = 0.70):
+    """The last date belonging to the training split, at `train_frac`
+    of the sorted distinct dates. Factored out from chronological_split
+    so callers that need to know "where training ends" BEFORE the full
+    train/val/test split exists (e.g. ml.dataset's label-threshold
+    computation, which must only look at training-period data) share
+    the exact same cutoff logic rather than risking a second,
+    slightly-different definition of "the training period" drifting in
+    alongside it.
+    """
+    unique_dates = np.sort(dates.unique())
+    n = len(unique_dates)
+    return unique_dates[int(n * train_frac) - 1]
+
+
 def chronological_split(
     dates: pd.Series, train_frac: float = 0.70, val_frac: float = 0.15
 ) -> dict[str, np.ndarray]:
     """Returns boolean masks {'train', 'val', 'test'} aligned to `dates`."""
     unique_dates = np.sort(dates.unique())
     n = len(unique_dates)
-    train_cutoff = unique_dates[int(n * train_frac) - 1]
+    train_cutoff = train_cutoff_date(dates, train_frac)
     val_cutoff = unique_dates[int(n * (train_frac + val_frac)) - 1]
 
     train_mask = (dates <= train_cutoff).to_numpy()

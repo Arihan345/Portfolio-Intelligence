@@ -52,14 +52,37 @@ def benchmark_comparison(
     portfolio_returns: pd.Series,
     benchmark_returns: pd.Series,
     risk_free_rate_annual: float = 0.0,
+    portfolio_cumulative_return_override: float | None = None,
 ) -> dict:
     """Bundles portfolio/benchmark cumulative return, excess return,
     tracking error, beta, alpha, information ratio and correlation into
-    one summary dict, all derived from the same aligned return pair."""
+    one summary dict, all derived from the same aligned return pair.
+
+    portfolio_cumulative_return_override (optional): compounding
+    portfolio_returns day-by-day (the default, and still what beta/
+    tracking-error/correlation/information-ratio below always use --
+    those genuinely need a real daily series) silently assumes those
+    returns came only from market moves. For a real portfolio built up
+    through many separate BUYs over time rather than one lump-sum
+    investment, a day with a large purchase relative to the then-small
+    NAV reads as a huge "daily return" in this series -- a real,
+    confirmed case: a portfolio that grew via 51 small trades over two
+    years showed a single day at +553% (a large relative buy, not a
+    553% market move), which compounded into a fabricated ~9,724%
+    "cumulative return" here while the portfolio's real total return on
+    invested capital was 10.67%. Passing that real, cost-basis total
+    return here overrides ONLY the headline cumulative-return figure
+    (and excess_cumulative_return, derived from it) with the correct
+    number; the underlying statistical series-based numbers keep using
+    the real daily series, unchanged.
+    """
     aligned = pd.concat([portfolio_returns, benchmark_returns], axis=1).dropna()
     aligned.columns = ["p", "b"]
 
-    portfolio_cum_return = float((1 + aligned["p"]).prod() - 1)
+    if portfolio_cumulative_return_override is not None:
+        portfolio_cum_return = float(portfolio_cumulative_return_override)
+    else:
+        portfolio_cum_return = float((1 + aligned["p"]).prod() - 1)
     benchmark_cum_return = float((1 + aligned["b"]).prod() - 1)
     ba = beta_alpha(aligned["p"], aligned["b"], risk_free_rate_annual)
 

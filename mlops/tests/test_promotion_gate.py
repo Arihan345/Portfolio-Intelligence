@@ -43,7 +43,7 @@ def _train_deliberately_bad_model(dataset: pd.DataFrame) -> dict:
     test_score = model.predict_proba(X_test)[:, 1]
     model_metrics = evaluate_binary_classifier(y_test.to_numpy(), test_pred, test_score)
 
-    baseline_pred_full = predict_baseline(dataset["volatility_21d"], dataset["vol_threshold"].iloc[0])
+    baseline_pred_full = predict_baseline(dataset["volatility_21d"], dataset["vol_threshold"])
     baseline_pred_test = baseline_pred_full[masks["test"]].astype(int).to_numpy()
     baseline_metrics = evaluate_binary_classifier(y_test.to_numpy(), baseline_pred_test)
 

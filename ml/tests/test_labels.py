@@ -34,9 +34,10 @@ def test_build_labels_assigns_1_above_threshold_0_below():
     prices = pd.DataFrame({"date": pd.bdate_range("2024-01-01", periods=n), "close": closes})
 
     trailing_vol = prices["close"].pct_change().rolling(21).std(ddof=1) * np.sqrt(252)
-    labels = build_labels(prices, trailing_vol)
+    threshold = historical_vol_threshold(trailing_vol)
+    labels = build_labels(prices, threshold)
 
     valid = labels.dropna(subset=["label"])
-    threshold = labels["vol_threshold"].iloc[0]
+    assert (valid["vol_threshold"] == threshold).all()
     assert (valid.loc[valid["realized_vol_forward"] > threshold, "label"] == 1).all()
     assert (valid.loc[valid["realized_vol_forward"] <= threshold, "label"] == 0).all()

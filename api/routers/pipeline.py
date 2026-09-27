@@ -20,7 +20,7 @@ def pipeline_status() -> PipelineStatusResponse:
             sa.text(
                 """
                 SELECT run_id, dag_id, status, rows_processed, started_at,
-                       completed_at, duration_seconds
+                       completed_at, duration_seconds, error_message
                 FROM pipeline_runs
                 ORDER BY started_at DESC
                 LIMIT 1
@@ -45,7 +45,7 @@ def pipeline_runs(limit: int = 20) -> list[PipelineStatusResponse]:
             sa.text(
                 """
                 SELECT run_id, dag_id, status, rows_processed, started_at,
-                       completed_at, duration_seconds
+                       completed_at, duration_seconds, error_message
                 FROM pipeline_runs
                 ORDER BY started_at DESC
                 LIMIT :limit

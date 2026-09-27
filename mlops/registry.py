@@ -15,6 +15,38 @@ PRODUCTION_ALIAS = "production"
 MIN_F1_IMPROVEMENT_OVER_BASELINE = 0.05
 
 
+def _parse_walk_forward_folds(params: dict, metrics: dict) -> list[dict]:
+    """Reassembles the wf_fold{N}_* params/metrics
+    mlops.tracking.log_training_run wrote (see that function's
+    docstring) into a per-fold list of dicts, ordered by fold number.
+    Returns [] for runs logged before this diagnostic existed, or runs
+    with no walk-forward data -- never fabricated."""
+    n_folds = int(params.get("walk_forward_n_folds", 0) or 0)
+    folds = []
+    for i in range(1, n_folds + 1):
+        prefix = f"wf_fold{i}"
+        if f"{prefix}_delta_f1" not in metrics:
+            continue
+        folds.append(
+            {
+                "fold": i,
+                "train_start": params.get(f"{prefix}_train_start"),
+                "train_end": params.get(f"{prefix}_train_end"),
+                "test_start": params.get(f"{prefix}_test_start"),
+                "test_end": params.get(f"{prefix}_test_end"),
+                "train_size": int(metrics.get(f"{prefix}_train_size", 0)),
+                "test_size": int(metrics.get(f"{prefix}_test_size", 0)),
+                "label_rate_train": metrics.get(f"{prefix}_label_rate_train"),
+                "label_rate_test": metrics.get(f"{prefix}_label_rate_test"),
+                "baseline_f1": metrics.get(f"{prefix}_baseline_f1"),
+                "model_f1": metrics.get(f"{prefix}_model_f1"),
+                "delta_f1": metrics.get(f"{prefix}_delta_f1"),
+                "model_beats_baseline": metrics.get(f"{prefix}_delta_f1", 0) > 0,
+            }
+        )
+    return folds
+
+
 @dataclass
 class PromotionResult:
     promoted: bool
@@ -136,12 +168,16 @@ def get_model_info(model_name: str = MODEL_NAME, alias_or_version: str = PRODUCT
         },
         "feature_version_hash": params.get("feature_version_hash"),
         "training_timestamp_utc": params.get("training_timestamp_utc"),
-        "metrics": {k: v for k, v in metrics.items() if not k.startswith("feature_importance_")},
+        "metrics": {
+            k: v for k, v in metrics.items()
+            if not k.startswith("feature_importance_") and not k.startswith("wf_fold")
+        },
         "feature_importances": {
             k[len("feature_importance_"):]: v
             for k, v in metrics.items()
             if k.startswith("feature_importance_")
         },
+        "walk_forward_folds": _parse_walk_forward_folds(params, metrics),
         "promotion_status": mv.tags.get("promotion_status"),
         "promotion_reason": mv.tags.get("promotion_reason"),
     }

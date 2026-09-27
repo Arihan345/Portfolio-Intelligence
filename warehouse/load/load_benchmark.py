@@ -26,14 +26,32 @@ SOURCE_SYSTEM = "yfinance"
 
 
 def upsert_benchmark_asset(as_of: date, run_id: str) -> int:
+    """`as_of` must be the EARLIEST date this benchmark row needs to
+    cover -- i.e. the earliest transaction date across whatever
+    portfolio upload triggered this call, not an arbitrary fixed date.
+    Same real bug class as upsert_dim_asset (see its docstring): a
+    hardcoded date(2024, 1, 1) here left ^NSEI's dim_asset row unable
+    to cover any real portfolio upload with an earlier transaction
+    date, and calling this again for an already-existing row never
+    backdated it -- confirmed for real: uploading a fixture with a
+    2023-01-03 transaction failed with "no dim_asset version covers
+    ^NSEI as of 2023-01-03" even after the same-shaped ticker-level bug
+    was fixed, because this is a separate benchmark-specific dim_asset
+    row with its own effective_from.
+    """
     with engine.begin() as conn:
         existing = conn.execute(
             sa.text(
-                "SELECT asset_key FROM dim_asset WHERE ticker = :ticker AND is_current"
+                "SELECT asset_key, effective_from FROM dim_asset WHERE ticker = :ticker AND is_current"
             ),
             {"ticker": BENCHMARK_TICKER},
         ).fetchone()
         if existing:
+            if as_of < existing.effective_from:
+                conn.execute(
+                    sa.text("UPDATE dim_asset SET effective_from = :ef WHERE asset_key = :key"),
+                    {"ef": as_of, "key": existing.asset_key},
+                )
             return existing.asset_key
 
         result = conn.execute(

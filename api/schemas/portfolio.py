@@ -14,6 +14,7 @@ class DataQualityReportResponse(BaseModel):
     values_imputed: int
     anomalies_flagged: int
     rows_unresolved: int
+    split_adjustments_applied: int
     notes: list[str]
 
 

@@ -13,3 +13,4 @@ class PipelineStatusResponse(BaseModel):
     started_at: datetime
     completed_at: datetime | None
     duration_seconds: float | None
+    error_message: str | None

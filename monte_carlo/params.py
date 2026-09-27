@@ -68,21 +68,48 @@ def _to_mu_gbm(historical_cagr: float, sigma_annual: float) -> float:
 def get_portfolio_params(
     portfolio_id: int, analysis_start: str, analysis_end: str
 ) -> PortfolioParams:
-    """Baseline-model parameters, straight from Phase 5's own
-    portfolio-level NAV series (mart_portfolio_performance)."""
-    pp = da.get_portfolio_performance(portfolio_id)
-    pp = pp[(pp["value_date"] >= analysis_start) & (pp["value_date"] <= analysis_end)]
-    pp = pp.set_index("value_date")
+    """Baseline-model parameters, from a real per-ticker weighted value
+    series (forecasting.arima.series.build_extended_portfolio_series)
+    rather than mart_portfolio_performance's raw NAV series directly.
 
-    daily_returns = pp["daily_return"].dropna()
+    Why not the raw NAV series: mart_portfolio_performance's cash model
+    (int_cash_flow.sql) treats every BUY as "externally funded" and
+    every SELL's proceeds as cash that sits untouched forever (its own
+    documented assumption, correct for avoiding a fake loss on a sale
+    day) -- but for a real portfolio with many sells whose proceeds
+    were actually reinvested into later purchases (never recorded as
+    separate DEPOSIT/WITHDRAWAL transactions, since a Groww order-
+    history export doesn't include bank transfers), that tracked cash
+    balance only ever grows, never nets back down when it's really
+    spent again. Confirmed for real: a real portfolio's tracked cash
+    balance reached +23,356 against a real market value of 17,371 --
+    s0 (from total_nav_inr) came out at 40,727, more than double the
+    real value, and the resulting CAGR/volatility were consequently
+    absurd (525% CAGR, 245% annualized volatility) -- Monte Carlo
+    percentile bands centered on ~13x the real current value, nowhere
+    near plausible. build_extended_portfolio_series instead builds a
+    value series purely from each currently-held ticker's own real
+    price history and TODAY's real weights/value -- anchored exactly to
+    the real market value, with no cash-tracking assumption to distort
+    it (the same real data ARIMA already uses successfully).
+
+    analysis_start/analysis_end are accepted for signature
+    compatibility with existing callers but no longer used to filter a
+    date range here -- the extended series always uses each held
+    ticker's own full available real price history.
+    """
+    from forecasting.arima.series import build_extended_portfolio_series
+
+    series = build_extended_portfolio_series(portfolio_id)
+    daily_returns = series.pct_change().dropna()
     sigma = annualized_volatility(daily_returns)
 
-    start_nav = float(pp["total_nav_inr"].iloc[0])
-    end_nav = float(pp["total_nav_inr"].iloc[-1])
-    historical_cagr = cagr(start_nav, end_nav, pp.index[0].date(), pp.index[-1].date())
+    start_value = float(series.iloc[0])
+    end_value = float(series.iloc[-1])
+    historical_cagr = cagr(start_value, end_value, series.index[0].date(), series.index[-1].date())
 
     return PortfolioParams(
-        s0=end_nav,
+        s0=end_value,
         cagr=historical_cagr,
         sigma_annual=sigma,
         mu_gbm=_to_mu_gbm(historical_cagr, sigma),

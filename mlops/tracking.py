@@ -10,6 +10,7 @@ import mlflow
 import mlflow.xgboost
 import pandas as pd
 
+from ml.walk_forward import WalkForwardFold
 from mlops.config import ARTIFACT_ROOT, EXPERIMENT_NAME, TRACKING_URI, ensure_store_dirs
 from mlops.versioning import compute_dataset_version, compute_feature_version
 
@@ -23,7 +24,11 @@ def _init_mlflow() -> None:
     mlflow.set_experiment(EXPERIMENT_NAME)
 
 
-def log_training_run(price_history: pd.DataFrame, train_result: dict) -> str:
+def log_training_run(
+    price_history: pd.DataFrame,
+    train_result: dict,
+    walk_forward_folds: list[WalkForwardFold] | None = None,
+) -> str:
     """train_result: the dict returned by ml.train.train_and_evaluate.
     Returns the MLflow run_id.
 
@@ -40,6 +45,14 @@ def log_training_run(price_history: pd.DataFrame, train_result: dict) -> str:
         run start time, which is also recorded automatically)
       - the trained model artifact (via mlflow.xgboost, which also
         captures the model's input/output schema)
+      - walk_forward_folds (optional): per-fold walk-forward CV results
+        (see ml.walk_forward), a SUPPLEMENTARY diagnostic surfaced
+        alongside the primary single-split evaluation above -- never
+        used by the promotion gate, which still gates only on the
+        primary split's delta_f1 (see mlops.registry.promote_if_beats_
+        baseline). Logged as wf_fold{N}_* metrics/params so
+        mlops.registry.get_model_info can read them back into a
+        structured per-fold list for the API/frontend to display.
     """
     _init_mlflow()
 
@@ -69,6 +82,22 @@ def log_training_run(price_history: pd.DataFrame, train_result: dict) -> str:
 
         for feature_name, importance in train_result["feature_importances"].items():
             mlflow.log_metric(f"feature_importance_{feature_name}", float(importance))
+
+        if walk_forward_folds:
+            mlflow.log_param("walk_forward_n_folds", len(walk_forward_folds))
+            for f in walk_forward_folds:
+                prefix = f"wf_fold{f.fold}"
+                mlflow.log_param(f"{prefix}_train_start", f.train_start)
+                mlflow.log_param(f"{prefix}_train_end", f.train_end)
+                mlflow.log_param(f"{prefix}_test_start", f.test_start)
+                mlflow.log_param(f"{prefix}_test_end", f.test_end)
+                mlflow.log_metric(f"{prefix}_train_size", f.train_size)
+                mlflow.log_metric(f"{prefix}_test_size", f.test_size)
+                mlflow.log_metric(f"{prefix}_label_rate_train", f.label_rate_train)
+                mlflow.log_metric(f"{prefix}_label_rate_test", f.label_rate_test)
+                mlflow.log_metric(f"{prefix}_baseline_f1", f.baseline_f1)
+                mlflow.log_metric(f"{prefix}_model_f1", f.model_f1)
+                mlflow.log_metric(f"{prefix}_delta_f1", f.delta_f1)
 
         mlflow.xgboost.log_model(model, name="model")
 

@@ -31,6 +31,14 @@ class DataQualityReport:
     values_imputed: int = 0
     anomalies_flagged: int = 0
     rows_unresolved: int = 0
+    # Rows whose quantity/price were rewritten by
+    # ingestion.portfolio_validation.apply_split_adjustments for a real
+    # stock split -- informational, never a rejection or an anomaly (a
+    # split-caused price drop is not a data problem). Kept as its own
+    # counter, distinct from anomalies_flagged, so a real corporate
+    # action is never presented as "concerning volatility" on the Data
+    # Quality page.
+    split_adjustments_applied: int = 0
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -42,6 +50,7 @@ class DataQualityReport:
             "values_imputed": self.values_imputed,
             "anomalies_flagged": self.anomalies_flagged,
             "rows_unresolved": self.rows_unresolved,
+            "split_adjustments_applied": self.split_adjustments_applied,
             "notes": self.notes,
         }
 
@@ -58,9 +67,21 @@ def _infer_currency(ticker: str) -> str | None:
 
 
 def clean_and_standardize(
-    df: pd.DataFrame, price_anomaly_threshold: float = PRICE_ANOMALY_THRESHOLD
+    df: pd.DataFrame,
+    price_anomaly_threshold: float = PRICE_ANOMALY_THRESHOLD,
+    split_adjustment_notes: list[str] | None = None,
 ) -> tuple[pd.DataFrame, DataQualityReport]:
+    """split_adjustment_notes (optional): audit notes produced by
+    ingestion.portfolio_validation.apply_split_adjustments, surfaced
+    here as their own counter/notes -- distinct from anomalies_flagged,
+    since a real stock split's price change is not the kind of
+    "concerning" price-anomaly this function's own detection below
+    flags (df is already split-adjusted by the time this runs, so that
+    detection naturally no longer misfires on it either)."""
     report = DataQualityReport(rows_in=len(df))
+    if split_adjustment_notes:
+        report.split_adjustments_applied = len(split_adjustment_notes)
+        report.notes.extend(f"[split-adjusted] {n}" for n in split_adjustment_notes)
     df = df.copy()
 
     # --- Ticker normalization ---

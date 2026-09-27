@@ -20,9 +20,15 @@ import numpy as np
 import pandas as pd
 
 
-def predict_baseline(trailing_vol_21d: pd.Series, threshold: float) -> pd.Series:
+def predict_baseline(trailing_vol_21d: pd.Series, threshold: float | pd.Series) -> pd.Series:
     """Returns a 0/1 Series (NaN where trailing_vol_21d itself is NaN,
-    i.e. the warm-up period with fewer than 21 days of history)."""
+    i.e. the warm-up period with fewer than 21 days of history).
+
+    `threshold` may be a single float (one ticker) or a per-row Series
+    aligned to `trailing_vol_21d`'s index (multiple tickers, each with
+    its own threshold -- pandas compares elementwise in that case, so
+    each row is checked against its OWN ticker's threshold rather than
+    one ticker's threshold being silently applied to every row)."""
     prediction = (trailing_vol_21d > threshold).astype("Int64")
     prediction[trailing_vol_21d.isna()] = pd.NA
     return prediction

@@ -44,6 +44,25 @@ class SectorIndustryResult:
     failed_tickers: list[tuple[str, str]] = field(default_factory=list)
 
 
+@dataclass
+class SplitEvent:
+    """A single stock-split / bonus-issue event. ratio follows the
+    yfinance convention: 10.0 means a 1-for-10 forward split (1 old
+    share becomes 10 new shares) -- quantity multiplies by ratio, price
+    divides by ratio. A ratio < 1 (e.g. 0.5) would be a reverse split;
+    the same arithmetic still applies."""
+
+    ticker: str
+    split_date: date
+    ratio: float
+
+
+@dataclass
+class CorporateActionsResult:
+    data: dict[str, list[SplitEvent]]
+    failed_tickers: list[tuple[str, str]] = field(default_factory=list)
+
+
 class MarketDataProvider(ABC):
     """Abstract interface for any market data source."""
 
@@ -64,5 +83,18 @@ class MarketDataProvider(ABC):
     ) -> SectorIndustryResult:
         """Fetch sector/industry classification for `tickers`. Same
         partial-failure contract as fetch_ohlcv.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def fetch_corporate_actions(
+        self, tickers: list[str], start: date, end: date
+    ) -> CorporateActionsResult:
+        """Fetch stock-split/bonus-issue events for `tickers` with an ex-
+        date between start and end (inclusive). Same partial-failure
+        contract as fetch_ohlcv/fetch_sector_industry: a bad or unknown
+        ticker is recorded in failed_tickers, never raised, so the rest
+        of the batch still returns data. A ticker with no split history
+        in range gets an empty list, not an entry in failed_tickers.
         """
         raise NotImplementedError

@@ -71,8 +71,17 @@ def train_and_evaluate(dataset: pd.DataFrame) -> dict:
 
     # Baseline: persistence of the CURRENT trailing-21d vol regime,
     # using this same test set's own trailing_vol / threshold columns.
+    # threshold is passed as the full per-row `vol_threshold` column,
+    # NOT dataset["vol_threshold"].iloc[0] -- an earlier version took
+    # a single scalar from row 0 of the (multi-ticker) dataset and
+    # applied it to every row regardless of ticker (row 0 happened to
+    # be RELIANCE.NS after sorting/concat, so TCS.NS rows were silently
+    # evaluated against RELIANCE.NS's threshold). Each row has its own
+    # ticker-correct threshold already in this column (see
+    # ml.dataset.build_dataset); comparing elementwise against the full
+    # column respects that instead of collapsing it to one value.
     baseline_pred_full = predict_baseline(
-        dataset["volatility_21d"], dataset["vol_threshold"].iloc[0]
+        dataset["volatility_21d"], dataset["vol_threshold"]
     )
     baseline_pred_test = baseline_pred_full[masks["test"]].astype(int).to_numpy()
     baseline_metrics = evaluate_binary_classifier(y_test.to_numpy(), baseline_pred_test)

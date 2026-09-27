@@ -1,0 +1,5 @@
+date,ticker,transaction_type,quantity,price,fees,tax,currency
+2022-01-03,TCS.NS,BUY,10,3500,20,0,INR
+2022-06-01,HDFCBANK.NS,BUY,2,15,0,0,INR
+2022-11-01,HDFCBANK.NS,SELL,2,45,0,0,INR
+2023-06-01,TCS.NS,SELL,3,3900,15,50,INR

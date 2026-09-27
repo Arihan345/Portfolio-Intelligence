@@ -8,26 +8,128 @@ status code.
 from __future__ import annotations
 
 import io
+import subprocess
+from datetime import date
+from pathlib import Path
 
+import pandas as pd
 import pytest
+import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
 from analytics import data_access as da
 from analytics.allocation.allocation import asset_allocation
 from analytics.allocation.concentration import herfindahl_hirschman_index
 from analytics.performance.returns import capital_summary
-from api.dependencies import ANALYSIS_END, ANALYSIS_START
 from api.main import app
 from monte_carlo.params import get_portfolio_params
 from monte_carlo.simulate import simulate_portfolio_gbm
+from warehouse.load.load_warehouse import (
+    derive_fact_holdings,
+    derive_fact_portfolio_returns,
+    derive_fact_portfolio_value,
+    engine,
+    finish_pipeline_run,
+    load_fact_transactions,
+    start_pipeline_run,
+    upsert_dim_asset,
+)
 
 client = TestClient(app)
 PORTFOLIO_ID = 1
 
+_DBT_SCRIPT = Path(__file__).resolve().parents[2] / "dbt" / "run_dbt.sh"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _restore_portfolio_1_after_module():
+    """test_upload_real_example_csv_runs_full_pipeline (below) uploads a
+    small fixed demo CSV to PORTFOLIO_ID=1 -- the SAME portfolio_id the
+    live app/frontend reads from, since this app is single-portfolio by
+    design -- and every other test in this module asserts exact known
+    values against that fixture data. Before the upload-replace fix
+    (see warehouse/tests/test_upload_replace_and_netting.py), a new
+    upload only ever appended, so running this suite was a harmless
+    no-op layered on top of whatever was already there. Now that a
+    second upload correctly REPLACES the portfolio's transactions (the
+    correct, intended fix for a real bug), running this suite for real
+    against the shared dev database silently destroys whatever real
+    portfolio was loaded there -- reproduced for real: a real 30-ticker
+    upload was wiped by a single run of this test file and replaced
+    with TCS.NS/RELIANCE.NS/INFY.NS, which then broke Attribution's
+    reconciliation (INFY.NS's BUY falls inside the attribution
+    endpoint's hardcoded no-trading window) and confused a real user
+    who saw demo data reappear on their live dashboard with no upload
+    of their own.
+
+    Snapshots portfolio 1's real fact_transactions (and current
+    dim_asset metadata) before this module's tests run, and restores
+    them -- full reload + full recompute + full dbt rebuild -- after,
+    so this test module's own necessarily-destructive design stays
+    externally invisible once it finishes.
+    """
+    with engine.begin() as conn:
+        original_rows = conn.execute(
+            sa.text(
+                "SELECT da.ticker, dd.full_date AS date, ft.transaction_type, "
+                "ft.quantity, ft.price, ft.price_inr, ft.fees, ft.tax, "
+                "ft.currency_code AS currency, ft.near_duplicate_flag, ft.price_anomaly_flag "
+                "FROM fact_transactions ft "
+                "JOIN dim_asset da ON da.asset_key = ft.asset_key "
+                "JOIN dim_date dd ON dd.date_key = ft.date_key "
+                "WHERE ft.portfolio_id = :p ORDER BY ft.transaction_id"
+            ),
+            {"p": PORTFOLIO_ID},
+        ).mappings().all()
+        asset_meta_rows = conn.execute(
+            sa.text(
+                "SELECT ticker, asset_name, sector, industry, exchange, currency_code "
+                "FROM dim_asset WHERE is_current"
+            )
+        ).mappings().all()
+
+    yield
+
+    run_id = start_pipeline_run(dag_id="pytest_restore")
+    if original_rows:
+        df = pd.DataFrame([dict(r) for r in original_rows])
+        df["date"] = df["date"].astype(str)
+        for col in ("quantity", "price", "price_inr", "fees", "tax"):
+            df[col] = df[col].astype(float)
+        asset_meta = {
+            r["ticker"]: {
+                "name": r["asset_name"], "sector": r["sector"], "industry": r["industry"],
+                "exchange": r["exchange"], "currency": r["currency_code"],
+            }
+            for r in asset_meta_rows
+        }
+        upsert_dim_asset(asset_meta, date(2024, 1, 1), "pytest_restore", run_id)
+        load_fact_transactions(df, PORTFOLIO_ID, "pytest_restore", run_id)
+    else:
+        # Portfolio 1 was genuinely empty before this module ran --
+        # restore that, not this module's own fixture upload.
+        with engine.begin() as conn:
+            conn.execute(sa.text("DELETE FROM fact_transactions WHERE portfolio_id = :p"), {"p": PORTFOLIO_ID})
+    derive_fact_holdings(PORTFOLIO_ID, "pytest_restore", run_id)
+    derive_fact_portfolio_value(PORTFOLIO_ID, "pytest_restore", run_id)
+    derive_fact_portfolio_returns(PORTFOLIO_ID, "pytest_restore", run_id)
+    finish_pipeline_run(run_id, "SUCCESS", len(original_rows))
+    # This module's own test already triggered at least one dbt build
+    # against the fixture data -- rebuild once more now that
+    # fact_transactions is back to the real pre-test state, so every
+    # mart (not just fact_transactions itself) reflects it too.
+    subprocess.run([str(_DBT_SCRIPT), "build"], capture_output=True, text=True, timeout=300)
+
 
 def _latest_asset_performance():
+    # No ANALYSIS_START/END filtering here anymore: the real endpoints
+    # (api/routers/portfolio.py) stopped capping "current" at the
+    # original demo's fixed 2024-06-30 window -- that was a real bug
+    # (a real portfolio uploaded with transactions through 2026 still
+    # reported a stale 2024 as_of_date and market value). This helper's
+    # job is to compute the SAME "latest available" value the endpoint
+    # itself now computes, so it must match that behavior exactly.
     ap = da.get_asset_performance(PORTFOLIO_ID)
-    ap = ap[(ap["as_of_date"] >= ANALYSIS_START) & (ap["as_of_date"] <= ANALYSIS_END)]
     return ap[ap["as_of_date"] == ap["as_of_date"].max()]
 
 
@@ -98,7 +200,6 @@ def test_allocation_matches_direct_analytics_call():
     body = r.json()
 
     alloc = da.get_allocation(PORTFOLIO_ID)
-    alloc = alloc[(alloc["as_of_date"] >= ANALYSIS_START) & (alloc["as_of_date"] <= ANALYSIS_END)]
     latest = alloc[alloc["as_of_date"] == alloc["as_of_date"].max()]
     weights = asset_allocation(latest)
 
@@ -138,8 +239,7 @@ def test_benchmark_matches_direct_analytics_call():
     assert r.status_code == 200
     body = r.json()
 
-    pp = da.get_portfolio_performance(PORTFOLIO_ID)
-    pp = pp[(pp["value_date"] >= ANALYSIS_START) & (pp["value_date"] <= ANALYSIS_END)].set_index("value_date")
+    pp = da.get_portfolio_performance(PORTFOLIO_ID).set_index("value_date")
     daily_returns = pp["daily_return"].dropna()
     bench = da.get_benchmark(PORTFOLIO_ID).set_index("value_date")
     bench_returns = bench["benchmark_daily_return"].reindex(daily_returns.index)
@@ -185,8 +285,10 @@ def test_monte_carlo_post_get_round_trip_matches_direct_engine_call():
 
     # Cross-check against calling the real Phase 6 engine directly with
     # the same seed and parameters -- must reproduce the exact terminal
-    # distribution (GBM with a fixed seed is deterministic).
-    params = get_portfolio_params(PORTFOLIO_ID, ANALYSIS_START, ANALYSIS_END)
+    # distribution (GBM with a fixed seed is deterministic). Matches
+    # api/routers/monte_carlo.py's own dynamic full-history window, not
+    # the original demo's fixed ANALYSIS_START/END.
+    params = get_portfolio_params(PORTFOLIO_ID, "1900-01-01", date.today().isoformat())
     paths = simulate_portfolio_gbm(params.s0, params.mu_gbm, params.sigma_annual, 252, 2000, seed=123)
     expected_median = float(__import__("numpy").median(paths[:, -1]))
     assert posted["percentile_bands"]["p50"] == pytest.approx(expected_median)

@@ -10,10 +10,12 @@ import pandas as pd
 import yfinance as yf
 
 from ingestion.providers.base import (
+    CorporateActionsResult,
     MarketDataProvider,
     OHLCVResult,
     SectorIndustry,
     SectorIndustryResult,
+    SplitEvent,
 )
 
 SOURCE_SYSTEM = "yfinance"
@@ -113,3 +115,26 @@ class YFinanceProvider(MarketDataProvider):
             )
 
         return SectorIndustryResult(data=result, failed_tickers=failed)
+
+    def fetch_corporate_actions(
+        self, tickers: list[str], start: date, end: date
+    ) -> CorporateActionsResult:
+        result: dict[str, list[SplitEvent]] = {}
+        failed: list[tuple[str, str]] = []
+
+        for ticker in tickers:
+            try:
+                splits = yf.Ticker(ticker).splits
+            except Exception as exc:  # noqa: BLE001 - must never propagate
+                failed.append((ticker, f"fetch error: {exc}"))
+                continue
+
+            events: list[SplitEvent] = []
+            if splits is not None:
+                for ts, ratio in splits.items():
+                    split_date = ts.date() if hasattr(ts, "date") else ts
+                    if start <= split_date <= end:
+                        events.append(SplitEvent(ticker=ticker, split_date=split_date, ratio=float(ratio)))
+            result[ticker] = events
+
+        return CorporateActionsResult(data=result, failed_tickers=failed)

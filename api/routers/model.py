@@ -14,7 +14,7 @@ from mlops.config import MODEL_NAME, TRACKING_URI
 from mlops.registry import PRODUCTION_ALIAS, get_model_info
 from mlops.tracking import _init_mlflow
 
-from api.schemas.model_status import DatasetVersionInfo, ModelStatusResponse
+from api.schemas.model_status import DatasetVersionInfo, ModelStatusResponse, WalkForwardFold
 
 router = APIRouter(prefix="/model", tags=["model"])
 
@@ -48,6 +48,7 @@ def model_status() -> ModelStatusResponse:
         training_timestamp_utc=info["training_timestamp_utc"],
         metrics=info["metrics"],
         feature_importances=info["feature_importances"],
+        walk_forward_folds=[WalkForwardFold(**f) for f in info["walk_forward_folds"]],
         promotion_status=info["promotion_status"],
         promotion_reason=info.get("promotion_reason"),
     )

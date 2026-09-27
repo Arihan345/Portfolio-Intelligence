@@ -6,7 +6,7 @@ parameters and its numpy output into the response schema.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -21,7 +21,7 @@ from monte_carlo.outputs import (
 from monte_carlo.params import get_asset_level_params, get_portfolio_params
 from monte_carlo.simulate import simulate_portfolio_gbm, simulate_portfolio_multi_asset
 
-from api.dependencies import ANALYSIS_END, ANALYSIS_START, get_portfolio_or_404
+from api.dependencies import get_portfolio_or_404
 from api.schemas.monte_carlo import (
     DrawdownStatistics,
     MonteCarloRequest,
@@ -33,13 +33,24 @@ from api.store import MONTE_CARLO_RESULTS
 
 router = APIRouter(prefix="/portfolio", tags=["monte-carlo"])
 
+# Real historical parameter estimation should use ALL available history
+# for whatever portfolio is currently loaded, not the original demo's
+# fixed Jan-Jun 2024 window (api.dependencies.ANALYSIS_START/END) --
+# capping mu/sigma estimation to 6 months of a since-replaced demo
+# portfolio would silently produce wrong parameters for any real
+# upload. "1900-01-01" is simply "no lower bound" (every real asset's
+# own first transaction date is later); the upper bound is always
+# today, dynamically, not a frozen date.
+_FULL_HISTORY_START = "1900-01-01"
+
 
 @router.post("/{portfolio_id}/monte-carlo", response_model=MonteCarloResponse)
 def run_monte_carlo(
     portfolio_id: int, request: MonteCarloRequest, _: None = Depends(get_portfolio_or_404)
 ) -> MonteCarloResponse:
+    today = date.today().isoformat()
     if request.model == "baseline":
-        params = get_portfolio_params(portfolio_id, ANALYSIS_START, ANALYSIS_END)
+        params = get_portfolio_params(portfolio_id, _FULL_HISTORY_START, today)
         s0 = params.s0
         mu = request.mu_annual_override if request.mu_annual_override is not None else params.mu_gbm
         sigma = request.sigma_annual_override if request.sigma_annual_override is not None else params.sigma_annual
@@ -47,7 +58,7 @@ def run_monte_carlo(
             s0, mu, sigma, request.horizon_days, request.n_simulations, seed=request.seed
         )
     else:
-        params = get_asset_level_params(portfolio_id, ANALYSIS_START, ANALYSIS_END)
+        params = get_asset_level_params(portfolio_id, _FULL_HISTORY_START, today)
         s0 = params.s0_total
         sigma = params.sigma_annual.copy()
         if request.sigma_annual_override is not None:

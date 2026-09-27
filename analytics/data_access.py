@@ -95,6 +95,45 @@ def get_benchmark(portfolio_id: int) -> pd.DataFrame:
     )
 
 
+def get_price_history(tickers: list[str]) -> pd.DataFrame:
+    """fact_daily_prices for the given tickers, across their full real
+    warehouse history -- prices are asset-level, not portfolio-scoped,
+    so this isn't parameterized by portfolio_id.
+
+    Used by forecasting/arima/series.py to build ARIMA's extended value
+    series from REAL price data already in the warehouse for whatever
+    tickers a real upload actually holds, instead of a separate, fixed
+    ml.data.fetch_price_history cache that was only ever built for the
+    ML model's own training universe (TCS.NS/RELIANCE.NS) and had no
+    real data at all for any other real portfolio's tickers -- the
+    exact real cause of a confirmed 422 ("missing tickers") on every
+    real upload's Forecasting/ARIMA and ML Insights pages. The
+    warehouse's own price history already covers every currently-held
+    ticker back to its first real transaction (fetched during upload,
+    the same mechanism Monte Carlo's baseline/asset-level params
+    already use successfully) -- unifying on it here means ARIMA never
+    depends on a second, separately-populated cache again.
+    """
+    if not tickers:
+        return pd.DataFrame(columns=["ticker", "date", "close"])
+    return pd.read_sql(
+        sa.text(
+            """
+            select distinct on (da.ticker, dd.full_date)
+                da.ticker, dd.full_date as date, fp.close
+            from fact_daily_prices fp
+            join dim_asset da on da.asset_key = fp.asset_key
+            join dim_date dd on dd.date_key = fp.date_key
+            where da.ticker in :tickers
+            order by da.ticker, dd.full_date, da.is_current desc, fp.asset_key asc
+            """
+        ).bindparams(sa.bindparam("tickers", expanding=True)),
+        engine,
+        params={"tickers": tickers},
+        parse_dates=["date"],
+    )
+
+
 def get_transactions(portfolio_id: int) -> pd.DataFrame:
     """stg_transactions: raw transaction cash flows, for XIRR."""
     return pd.read_sql(

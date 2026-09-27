@@ -8,7 +8,7 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -24,7 +24,18 @@ from analytics.allocation.allocation import (
 from analytics.allocation.concentration import herfindahl_hirschman_index, top_n_pct
 from analytics.attribution.attribution import asset_contribution, sector_contribution
 from analytics.benchmark.benchmark import benchmark_comparison
-from analytics.performance.returns import cagr, capital_summary, periodic_returns, rolling_returns, time_weighted_return, xirr
+from analytics.performance.returns import (
+    annualize_return,
+    cagr,
+    capital_summary,
+    daily_returns_from_value_and_flows,
+    net_external_cash_flows_by_day,
+    periodic_returns,
+    realized_pnl_summary,
+    rolling_returns,
+    time_weighted_return,
+    xirr,
+)
 from analytics.risk.risk import (
     annualized_volatility,
     beta_alpha,
@@ -38,12 +49,15 @@ from analytics.risk.risk import (
     sortino_ratio,
 )
 from ingestion.cleaning import clean_and_standardize
-from ingestion.portfolio_validation import validate_csv
+from ingestion.portfolio_validation import TICKER_PATTERN, validate_csv
 from ingestion.providers.yfinance_provider import YFinanceProvider
+from warehouse.load.load_benchmark import BENCHMARK_TICKER, upsert_benchmark_asset
 from warehouse.load.load_warehouse import (
+    dbt_build_lock,
     derive_fact_holdings,
     derive_fact_portfolio_returns,
     derive_fact_portfolio_value,
+    ensure_dim_date_coverage,
     finish_pipeline_run,
     load_fact_daily_prices,
     load_fact_transactions,
@@ -51,7 +65,7 @@ from warehouse.load.load_warehouse import (
     upsert_dim_asset,
 )
 
-from api.dependencies import ANALYSIS_END, ANALYSIS_START, get_portfolio_or_404
+from api.dependencies import get_portfolio_or_404
 from api.schemas.allocation import AllocationResponse
 from api.schemas.attribution import AttributionResponse
 from api.schemas.benchmark import BenchmarkResponse
@@ -67,55 +81,275 @@ from api.schemas.risk import BetaAlpha, MaxDrawdown, RiskResponse
 
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 
-# The only tickers this project has seeded metadata for (dim_asset,
-# analytics marts) -- see warehouse/load/run_load.py's own asset_meta.
-# Rows for any other ticker are validated/cleaned like everything else,
-# but excluded from the warehouse load stage, mirroring that script's
-# existing, documented behavior exactly rather than inventing new scope.
-KNOWN_TICKERS = ["TCS.NS", "RELIANCE.NS"]
-ASSET_META = {
-    "TCS.NS": {"name": "Tata Consultancy Services", "sector": "Technology",
-               "industry": "IT Services", "exchange": "NSE", "currency": "INR"},
-    "RELIANCE.NS": {"name": "Reliance Industries", "sector": "Energy",
-                     "industry": "Conglomerate", "exchange": "NSE", "currency": "INR"},
-}
 DEFAULT_PORTFOLIO_ID = 1
+
+# Ticker suffix -> exchange, per the same .NS/.BO convention
+# ingestion/portfolio_validation.py's TICKER_PATTERN already requires.
+_EXCHANGE_BY_SUFFIX = {"NS": "NSE", "BO": "BSE"}
+
+# A genuinely actively-traded NSE/BSE ticker has a trading day's row for
+# nearly every business day in the probe window (confirmed real:
+# 600+ rows over a ~2.5 year window). A phantom/misresolved symbol
+# returns exactly 1 stray row regardless of window length. 10 is a
+# deliberately generous floor -- comfortably above the phantom signal,
+# comfortably below what any real multi-month listing would have.
+_MIN_REAL_ROWS = 10
+
+
+def _resolve_real_exchange_suffix(
+    tickers: list[str], provider: YFinanceProvider, probe_start: date, probe_end: date
+) -> tuple[dict[str, str], list[str]]:
+    """Ticker SHAPE validation (portfolio_validation.TICKER_PATTERN)
+    only checks that a ticker looks like "BODY.NS" or "BODY.BO" -- it
+    can't catch a syntactically-plausible ticker that isn't a real,
+    tradeable listing at all. Real, confirmed case: a converted CSV
+    recorded "MON100.BO", "MONQ50.BO", "MAFANG.BO" for three NSE-only
+    Motilal Oswal/Mirae Asset ETFs with NO real BSE listing -- each
+    returns exactly ONE stray row of data from yfinance for the whole
+    probe window (a fallback/misresolved-symbol artifact) versus 600+
+    rows for a genuinely actively-traded ticker over the same window,
+    and a generic/unrelated company name from BSE's own symbol lookup
+    (e.g. "CHF/BAM" for "MON100.BO"), while the real ".NS" ticker for
+    the same company has real, dense trading data. Silently proceeding
+    with the phantom ".BO" ticker produces a position with essentially
+    fabricated-empty price history instead of the real one.
+
+    Tickers are probed ONE AT A TIME, not batched together: batching a
+    phantom ticker's OHLCV request alongside a genuinely real one was
+    observed to make yfinance return a false "this has real data" read
+    for the phantom too (a real, reproduced quirk, not a hypothetical
+    -- rows appeared for "MON100.BO" only when queried in the same
+    batch as "TCS.NS", not when queried alone or with only the other
+    phantom tickers). One request per ticker is slower but reliable.
+
+    For each candidate ticker with sparse OHLCV (fewer than
+    _MIN_REAL_ROWS rows) over the upload's own transaction date range,
+    tries the OTHER exchange suffix for the same company; if THAT has
+    real (dense) data, treats it as the correct ticker. probe_start/
+    probe_end should cover the actual dates this upload's transactions
+    need real prices for, not an arbitrary recent window.
+
+    Returns (rename_map, notes) -- rename_map only contains corrections
+    actually needed (old -> new). A ticker where NEITHER suffix has
+    real data is left alone (a genuinely delisted/wrong ticker is a
+    different, separate problem from this specific exchange-suffix
+    mixup, and will still surface on its own downstream).
+    """
+    shaped = [t for t in tickers if TICKER_PATTERN.match(t)]
+    if not shaped:
+        return {}, []
+
+    def _row_count(ticker: str) -> int:
+        result = provider.fetch_ohlcv([ticker], probe_start, probe_end)
+        return len(result.data)
+
+    row_counts = {t: _row_count(t) for t in shaped}
+    rename_map: dict[str, str] = {}
+    notes: list[str] = []
+    for ticker in shaped:
+        if row_counts[ticker] >= _MIN_REAL_ROWS:
+            continue
+        body, suffix = ticker.rsplit(".", 1)
+        swapped = f"{body}.{'NS' if suffix == 'BO' else 'BO'}"
+        swapped_rows = row_counts.get(swapped)
+        if swapped_rows is None:
+            swapped_rows = _row_count(swapped)
+        if swapped_rows >= _MIN_REAL_ROWS:
+            rename_map[ticker] = swapped
+            notes.append(
+                f"'{ticker}' has essentially no real trading data on that exchange "
+                f"({row_counts[ticker]} row(s) vs. {swapped_rows} for '{swapped}' -- likely no real "
+                f"listing there) -- corrected to '{swapped}'"
+            )
+    return rename_map, notes
+
+
+def _build_asset_meta(tickers: list[str]) -> dict[str, dict]:
+    """Real dim_asset metadata for whatever tickers actually appear in
+    this upload -- NOT a hardcoded allowlist. An earlier version of
+    this endpoint copied warehouse/load/run_load.py's demo scoping
+    (KNOWN_TICKERS = ["TCS.NS", "RELIANCE.NS"]) and used it to silently
+    filter the cleaned rows before they ever reached the warehouse: any
+    real upload with different tickers validated and cleaned
+    successfully, then had every single row dropped by that filter,
+    while the pipeline still reported SUCCESS with total_rows=0. Sector/
+    industry are fetched for real via the provider abstraction
+    (fetch_sector_industry already existed for exactly this and was
+    unused here); a ticker yfinance has no info for still gets a row --
+    sector/industry are nullable in dim_asset -- rather than being
+    dropped again at this later stage.
+    """
+    provider = YFinanceProvider()
+    sector_result = provider.fetch_sector_industry(tickers)
+    meta: dict[str, dict] = {}
+    for ticker in tickers:
+        info = sector_result.data.get(ticker)
+        suffix = ticker.rsplit(".", 1)[-1] if "." in ticker else ""
+        meta[ticker] = {
+            "name": ticker.split(".")[0],
+            "sector": info.sector if info else None,
+            "industry": info.industry if info else None,
+            "exchange": _EXCHANGE_BY_SUFFIX.get(suffix),
+            "currency": "INR",
+        }
+    return meta
 
 
 @router.post("/upload", response_model=UploadResponse)
-async def upload_portfolio(file: UploadFile) -> UploadResponse:
+def upload_portfolio(file: UploadFile) -> UploadResponse:
     """Runs the full existing pipeline: Phase 2 validate -> clean -> Phase
     3 warehouse load -> Phase 4 dbt rebuild. Returns the same
-    DataQualityReport shape Phase 2 already defines."""
-    contents = await file.read()
+    DataQualityReport shape Phase 2 already defines.
+
+    Declared as a plain `def`, not `async def`: this function's real
+    work (pandas, psycopg, a blocking dbt subprocess) has no `await`
+    points, so an `async def` version of it runs entirely on FastAPI's
+    single event loop and blocks it for the whole ~6-9s pipeline
+    duration -- during which even unrelated requests (e.g. GET
+    /portfolio/1/overview) would hang, and concurrent uploads would be
+    serialized as an accidental side effect rather than by any real
+    concurrency guarantee. A plain `def` runs in Starlette's threadpool
+    instead, giving genuine concurrency for other requests and
+    exercising the actual DB-level idempotency/locking this endpoint
+    depends on (see _lock_portfolio_recompute in
+    warehouse/load/load_warehouse.py) rather than masking it.
+    """
+    contents = file.file.read()
     with tempfile.NamedTemporaryFile(mode="wb", suffix=".csv", delete=False) as tmp:
         tmp.write(contents)
         tmp_path = tmp.name
 
     try:
+        # Real stock splits/bonus issues must be applied BEFORE
+        # validation's oversold check (a pre-split BUY otherwise reads
+        # as impossibly smaller than a post-split SELL of the same real
+        # position -- confirmed for real: PCJEWELLER.NS's 1:10 split).
+        # This needs the tickers up front, so a lightweight raw read
+        # happens here, before the real validate_csv call below -- never
+        # raises on a garbage/unreadable file; that's validate_csv's job.
+        ticker_correction_notes: list[str] = []
         try:
-            vresult = validate_csv(tmp_path, today=date.today())
+            raw_peek = pd.read_csv(tmp_path, dtype=str, keep_default_na=False)
+            candidate_tickers = sorted(
+                {str(t).strip().upper() for t in raw_peek.get("ticker", []) if str(t).strip()}
+            )
+        except Exception:
+            candidate_tickers = []
+            raw_peek = None
+
+        if candidate_tickers and raw_peek is not None:
+            # Best-effort earliest date across the raw file (structural
+            # validation hasn't run yet, so this tolerates unparseable
+            # rows rather than failing on them) -- the resolver needs to
+            # probe the ACTUAL transaction date range, not an arbitrary
+            # recent window (see its own docstring for why).
+            parsed_dates = pd.to_datetime(raw_peek.get("date", []), errors="coerce").dropna()
+            probe_start = parsed_dates.min().date() if not parsed_dates.empty else date(2020, 1, 1)
+            rename_map, ticker_correction_notes = _resolve_real_exchange_suffix(
+                candidate_tickers, YFinanceProvider(), probe_start, date.today()
+            )
+            if rename_map:
+                raw_peek["ticker"] = raw_peek["ticker"].apply(
+                    lambda t: rename_map.get(str(t).strip().upper(), t)
+                )
+                raw_peek.to_csv(tmp_path, index=False)
+                candidate_tickers = sorted(
+                    {str(t).strip().upper() for t in raw_peek["ticker"] if str(t).strip()}
+                )
+
+        splits: dict[str, list] = {}
+        if candidate_tickers:
+            actions = YFinanceProvider().fetch_corporate_actions(
+                candidate_tickers, start=date(2000, 1, 1), end=date.today()
+            )
+            splits = actions.data
+
+        try:
+            vresult = validate_csv(tmp_path, today=date.today(), splits=splits)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=f"malformed CSV: {exc}") from exc
 
-        cleaned, dq_report = clean_and_standardize(vresult.valid_rows)
-        cleaned = cleaned[cleaned["ticker"].isin(KNOWN_TICKERS)].reset_index(drop=True)
+        cleaned, dq_report = clean_and_standardize(
+            vresult.valid_rows, split_adjustment_notes=vresult.split_adjustment_notes
+        )
+        if ticker_correction_notes:
+            dq_report.notes = [f"[ticker-corrected] {n}" for n in ticker_correction_notes] + dq_report.notes
 
         run_id = start_pipeline_run(dag_id="api_upload")
         total_rows = 0
         try:
-            asset_keys = upsert_dim_asset(ASSET_META, date(2024, 1, 1), "api_upload", run_id)
+            tickers_in_upload = sorted(cleaned["ticker"].unique().tolist()) if not cleaned.empty else []
+            asset_meta = _build_asset_meta(tickers_in_upload) if tickers_in_upload else {}
+            start_d = pd.to_datetime(cleaned["date"]).min().date() if not cleaned.empty else None
+            end_d = date.today()
+
+            # Both dimension tables this upload's facts will reference
+            # must be extended to cover the upload's own real date/
+            # ticker range BEFORE any fact table is loaded -- dim_date
+            # and dim_asset were each originally a fixed, one-time-
+            # built range from the project's early demo setup (dim_date:
+            # warehouse/sql/04_seed_reference.sql's 2023-2026 seed;
+            # dim_asset: whichever tickers existed at the time) with no
+            # mechanism to extend for a later upload's real data. Both
+            # extensions are idempotent (ON CONFLICT DO NOTHING /
+            # backdate-if-later-needed) and committed in their own
+            # transaction each, so if a later step in this same upload
+            # fails, the only effect is that these dimension tables
+            # already cover a wider range than any fact table
+            # references yet -- harmless, and reused safely on retry.
+            if start_d is not None:
+                ensure_dim_date_coverage(start_d, end_d)
+            # Every ticker's dim_asset effective_from is backdated to
+            # this SAME upload-wide start_d (not each ticker's own
+            # individual earliest transaction date, and not a fixed
+            # constant). This was tried per-ticker first and broke a
+            # different way: fact_daily_prices' OHLCV fetch below also
+            # starts at this same upload-wide start_d for EVERY ticker
+            # (a ticker's real market price history exists before you
+            # personally first bought it), so a per-ticker dim_asset
+            # date narrower than start_d left load_fact_daily_prices
+            # unable to resolve an asset_key for that ticker's own
+            # price rows between start_d and its first transaction --
+            # confirmed for real: HDFCBANK.NS's dim_asset row correctly
+            # covered its own 2022-06-01 first trade, but the upload's
+            # OHLCV fetch (start_d = 2022-01-03, TCS.NS's earlier first
+            # trade) pulled HDFCBANK.NS price rows back to 2022-01-03
+            # too, and resolve_asset_key_for_date failed on those. One
+            # shared start_d for both dim_date and every ticker's
+            # dim_asset row removes the mismatch instead of chasing it
+            # ticker by ticker; backdating a ticker's dim_asset further
+            # than its own first trade is harmless (see
+            # upsert_dim_asset's docstring).
+            asset_keys = upsert_dim_asset(asset_meta, start_d, "api_upload", run_id) if start_d is not None else {}
 
             n = load_fact_transactions(cleaned, DEFAULT_PORTFOLIO_ID, "api_upload", run_id)
             total_rows += n
 
             if not cleaned.empty:
-                tickers_present = sorted(cleaned["ticker"].unique().tolist())
-                start_d = pd.to_datetime(cleaned["date"]).min().date()
-                end_d = date.today()
+                tickers_present = tickers_in_upload
                 provider = YFinanceProvider()
                 ohlcv = provider.fetch_ohlcv(tickers_present, start_d, end_d)
                 n = load_fact_daily_prices(ohlcv.data, "api_upload", run_id)
+                total_rows += n
+
+                # The NIFTY 50 benchmark index's own OHLCV was only ever
+                # loaded once, by a standalone demo script
+                # (warehouse/load/load_benchmark.py), hardcoded to the
+                # original Jan-Jun 2024 demo window -- never refreshed by
+                # a real upload. mart_asset_performance/mart_portfolio_
+                # performance correctly extend to today (their own OHLCV
+                # is fetched above), but mart_benchmark and Risk's
+                # correlation-to-NIFTY50 stayed capped at 2024-06-28
+                # regardless, since the benchmark series itself had
+                # nothing past that date to join against. Re-fetching it
+                # here (upsert_benchmark_asset/load_fact_daily_prices are
+                # both idempotent -- ON CONFLICT DO UPDATE / no-op if the
+                # asset row already exists) keeps it current with every
+                # real upload, the same way the portfolio's own tickers
+                # already are.
+                upsert_benchmark_asset(start_d, run_id)
+                benchmark_ohlcv = provider.fetch_ohlcv([BENCHMARK_TICKER], start_d, end_d)
+                n = load_fact_daily_prices(benchmark_ohlcv.data, "api_upload", run_id)
                 total_rows += n
 
             derive_fact_holdings(DEFAULT_PORTFOLIO_ID, "api_upload", run_id)
@@ -123,16 +357,27 @@ async def upload_portfolio(file: UploadFile) -> UploadResponse:
             derive_fact_portfolio_returns(DEFAULT_PORTFOLIO_ID, "api_upload", run_id)
 
             dbt_script = Path(__file__).resolve().parents[2] / "dbt" / "run_dbt.sh"
-            dbt_result = subprocess.run(
-                [str(dbt_script), "build"], capture_output=True, text=True, timeout=300
-            )
+            # dbt's own table-swap materialization isn't safe for
+            # concurrent `dbt build` runs against the same warehouse
+            # (reproduced: two concurrent uploads both hit "relation
+            # ...__dbt_backup already exists"). Serialize the whole
+            # warehouse-wide build step, not just this portfolio's rows.
+            with dbt_build_lock():
+                dbt_result = subprocess.run(
+                    [str(dbt_script), "build"], capture_output=True, text=True, timeout=300
+                )
             if dbt_result.returncode != 0:
                 raise RuntimeError(f"dbt build failed: {dbt_result.stdout}\n{dbt_result.stderr}")
 
             finish_pipeline_run(run_id, "SUCCESS", total_rows)
             status = "SUCCESS"
         except Exception as exc:
-            finish_pipeline_run(run_id, "FAILED", total_rows)
+            # error_message is now captured on the pipeline_runs row
+            # itself (Phase 10 investigation found FAILED runs with no
+            # record of why -- a confirmed gap, not just an inconvenience,
+            # since it made distinguishing "known dbt/env hiccup" from
+            # "new concurrency bug" impossible without terminal scrollback).
+            finish_pipeline_run(run_id, "FAILED", total_rows, error_message=f"{type(exc).__name__}: {exc}")
             raise HTTPException(status_code=500, detail=f"pipeline failed: {exc}") from exc
 
         return UploadResponse(
@@ -154,18 +399,29 @@ async def upload_portfolio(file: UploadFile) -> UploadResponse:
 @router.get("/{portfolio_id}/overview", response_model=PortfolioOverviewResponse)
 def get_overview(portfolio_id: int, _: None = Depends(get_portfolio_or_404)) -> PortfolioOverviewResponse:
     ap = da.get_asset_performance(portfolio_id)
-    ap = ap[(ap["as_of_date"] >= ANALYSIS_START) & (ap["as_of_date"] <= ANALYSIS_END)]
     latest = ap[ap["as_of_date"] == ap["as_of_date"].max()]
     if latest.empty:
         raise HTTPException(status_code=404, detail=f"no holdings data for portfolio {portfolio_id}")
 
     invested_capital = float(latest["cost_basis_inr"].sum())
     market_value = float(latest["market_value_inr"].sum())
-    summary = capital_summary(invested_capital, market_value)
+    realized = realized_pnl_summary(da.get_transactions(portfolio_id))
+    summary = capital_summary(invested_capital, market_value, realized)
 
     alloc = da.get_allocation(portfolio_id)
     alloc_latest = alloc[alloc["as_of_date"] == latest["as_of_date"].iloc[0]]
-    weights = asset_allocation(alloc_latest)
+    # "Current holdings" means positions actually held today -- a fully
+    # exited position (quantity_held netted to 0, confirmed real cases:
+    # PCJEWELLER.NS, ALOKINDS.NS, SWANCORP.NS, and others in this same
+    # real portfolio) has market_value_inr == 0 and contributed exactly
+    # 0 weight, but still showed up as its own 0.00% row in the list --
+    # every ticker ever traded, not what's actually owned. Filtered out
+    # here (not in asset_allocation itself, which stays a general-
+    # purpose weighted breakdown); invested_capital/market_value above
+    # deliberately still sum ALL rows, unfiltered -- those are portfolio
+    # totals, not the holdings list, and changing them isn't this fix.
+    alloc_latest_held = alloc_latest[alloc_latest["market_value_inr"] > 1e-9]
+    weights = asset_allocation(alloc_latest_held)
 
     return PortfolioOverviewResponse(
         portfolio_id=portfolio_id,
@@ -180,23 +436,60 @@ def get_overview(portfolio_id: int, _: None = Depends(get_portfolio_or_404)) -> 
 
 @router.get("/{portfolio_id}/performance", response_model=PerformanceResponse)
 def get_performance(portfolio_id: int, _: None = Depends(get_portfolio_or_404)) -> PerformanceResponse:
-    pp = da.get_portfolio_performance(portfolio_id)
-    pp = pp[(pp["value_date"] >= ANALYSIS_START) & (pp["value_date"] <= ANALYSIS_END)].set_index("value_date")
+    pp = da.get_portfolio_performance(portfolio_id).set_index("value_date")
     if pp.empty:
         raise HTTPException(status_code=404, detail=f"no performance data for portfolio {portfolio_id}")
 
     ap = da.get_asset_performance(portfolio_id)
-    ap = ap[(ap["as_of_date"] >= ANALYSIS_START) & (ap["as_of_date"] <= ANALYSIS_END)]
     latest = ap[ap["as_of_date"] == ap["as_of_date"].max()]
-    summary = capital_summary(float(latest["cost_basis_inr"].sum()), float(latest["market_value_inr"].sum()))
-
-    start_nav, end_nav = float(pp["total_nav_inr"].iloc[0]), float(pp["total_nav_inr"].iloc[-1])
-    cagr_value = cagr(start_nav, end_nav, pp.index[0].date(), pp.index[-1].date())
-    monthly = periodic_returns(pp["daily_return"], freq="ME")
-    rolling_30d = rolling_returns(pp["daily_return"], window=30)
-    twr = time_weighted_return(pp["total_nav_inr"])
-
     tx = da.get_transactions(portfolio_id)
+    realized = realized_pnl_summary(tx)
+    summary = capital_summary(float(latest["cost_basis_inr"].sum()), float(latest["market_value_inr"].sum()), realized)
+
+    # CAGR/TWR are computed from a CORRECTED daily holdings-value series,
+    # not mart_portfolio_performance.total_nav_inr/daily_return directly.
+    # Two real, confirmed problems with that mart series for this
+    # purpose: (1) total_nav_inr's cash_balance_inr leg only ever grows
+    # (every SELL's proceeds sit there forever, even when later
+    # reinvested -- see monte_carlo/params.py's docstring for the same
+    # root cause already fixed there), inflating the ending value; (2) a
+    # position bought before it has any real market price yet (e.g. an
+    # IPO-day purchase recorded the day before listing) prices at INR 0
+    # for that gap -- a real, already-held position with real cost
+    # basis, not actually worthless -- so the day real price data
+    # begins reads as a fake explosive "return" (confirmed for real: a
+    # portfolio showed +443% on the single day a pre-listing holding's
+    # price data started, which chain-linked into a 5.2495 CAGR and an
+    # 86.8 cumulative TWR for the whole multi-year history). Filling
+    # that gap at cost (a real, already-committed position without an
+    # observable market price is conventionally valued at cost, never
+    # at zero) removes the artifact at its source rather than papering
+    # over the resulting number.
+    ap_gap_filled = ap.copy()
+    no_price_yet = (ap_gap_filled["quantity_held"] > 0) & (ap_gap_filled["market_value_inr"].abs() < 1e-9)
+    ap_gap_filled.loc[no_price_yet, "market_value_inr"] = ap_gap_filled.loc[no_price_yet, "cost_basis_inr"]
+    holdings_value = ap_gap_filled.groupby("as_of_date")["market_value_inr"].sum().sort_index()
+
+    # Cash flows for THIS holdings-value series must be valued on the
+    # SAME real-market-price basis holdings_value itself uses -- not
+    # the transaction's own recorded price (net_external_cash_flows_by_
+    # day, still used below for XIRR, where the real recorded price IS
+    # what should count). Confirmed real, non-hypothetical case: a
+    # ticker string that happens to have its own real, unrelated
+    # yfinance price data priced a SELL's cash-out at that real close
+    # while the transaction itself recorded a wildly different price,
+    # producing a fake ~-92% single-day return purely from the
+    # mismatch. See implied_market_value_cash_flows_by_day's own
+    # docstring for the full mechanism and hand-traced numbers.
+    cash_flows_by_day = implied_market_value_cash_flows_by_day(ap_gap_filled)
+
+    daily_ret_adj = daily_returns_from_value_and_flows(holdings_value, cash_flows_by_day)
+    twr = time_weighted_return(holdings_value, cash_flows_by_day)
+    history_days = (holdings_value.index[-1] - holdings_value.index[0]).days
+    cagr_value = annualize_return(twr, history_days)
+    monthly = periodic_returns(daily_ret_adj, freq="ME")
+    rolling_30d = rolling_returns(daily_ret_adj, window=30)
+
     buy_sell_div = tx[tx["transaction_type"].isin(["BUY", "SELL", "DIVIDEND"])]
     cash_flows = []
     for _, r in buy_sell_div.iterrows():
@@ -224,15 +517,17 @@ def get_performance(portfolio_id: int, _: None = Depends(get_portfolio_or_404)) 
 @router.get("/{portfolio_id}/allocation", response_model=AllocationResponse)
 def get_allocation_endpoint(portfolio_id: int, _: None = Depends(get_portfolio_or_404)) -> AllocationResponse:
     alloc = da.get_allocation(portfolio_id)
-    alloc = alloc[(alloc["as_of_date"] >= ANALYSIS_START) & (alloc["as_of_date"] <= ANALYSIS_END)]
     if alloc.empty:
         raise HTTPException(status_code=404, detail=f"no allocation data for portfolio {portfolio_id}")
     latest = alloc[alloc["as_of_date"] == alloc["as_of_date"].max()]
+    # Exclude fully-exited positions (quantity_held netted to 0, so
+    # market_value_inr == 0) from the current-holdings breakdown -- see
+    # the matching comment in get_overview for the real case this fixes.
+    latest = latest[latest["market_value_inr"] > 1e-9]
 
     weights = asset_allocation(latest)
 
     pp = da.get_portfolio_performance(portfolio_id)
-    pp = pp[(pp["value_date"] >= ANALYSIS_START) & (pp["value_date"] <= ANALYSIS_END)]
     last_pp = pp.iloc[-1]
 
     return AllocationResponse(
@@ -256,8 +551,7 @@ def get_risk(
     var_confidence: float = 0.95,
     _: None = Depends(get_portfolio_or_404),
 ) -> RiskResponse:
-    pp = da.get_portfolio_performance(portfolio_id)
-    pp = pp[(pp["value_date"] >= ANALYSIS_START) & (pp["value_date"] <= ANALYSIS_END)].set_index("value_date")
+    pp = da.get_portfolio_performance(portfolio_id).set_index("value_date")
     if pp.empty:
         raise HTTPException(status_code=404, detail=f"no risk data for portfolio {portfolio_id}")
     daily_returns = pp["daily_return"].dropna()
@@ -268,7 +562,6 @@ def get_risk(
     mdd = max_drawdown(pp["total_nav_inr"])
 
     ap = da.get_asset_performance(portfolio_id)
-    ap = ap[(ap["as_of_date"] >= ANALYSIS_START) & (ap["as_of_date"] <= ANALYSIS_END)]
     wide = ap.pivot(index="as_of_date", columns="ticker", values="market_value_inr").pct_change().dropna(how="all")
     wide["NIFTY50"] = bench_returns.reindex(wide.index)
     corr = correlation_matrix(wide)
@@ -302,8 +595,7 @@ def get_risk(
 def get_benchmark_endpoint(
     portfolio_id: int, risk_free_rate_annual: float = 0.07, _: None = Depends(get_portfolio_or_404)
 ) -> BenchmarkResponse:
-    pp = da.get_portfolio_performance(portfolio_id)
-    pp = pp[(pp["value_date"] >= ANALYSIS_START) & (pp["value_date"] <= ANALYSIS_END)].set_index("value_date")
+    pp = da.get_portfolio_performance(portfolio_id).set_index("value_date")
     if pp.empty:
         raise HTTPException(status_code=404, detail=f"no benchmark data for portfolio {portfolio_id}")
     daily_returns = pp["daily_return"].dropna()
@@ -311,17 +603,84 @@ def get_benchmark_endpoint(
     bench = da.get_benchmark(portfolio_id).set_index("value_date")
     bench_returns = bench["benchmark_daily_return"].reindex(daily_returns.index)
 
-    comparison = benchmark_comparison(daily_returns, bench_returns, risk_free_rate_annual)
+    # Real total return on invested capital (same calculation
+    # get_overview uses) -- overrides the naive compounded-daily-return
+    # cumulative figure below, which a real portfolio built up through
+    # many separate purchases over time (not one lump-sum investment)
+    # distorts into a fabricated headline number (confirmed real case:
+    # ~9,724% vs. the portfolio's real 10.67% total return). See
+    # benchmark_comparison's own docstring for the full mechanism.
+    ap = da.get_asset_performance(portfolio_id)
+    latest_ap = ap[ap["as_of_date"] == ap["as_of_date"].max()]
+    real_total_return = capital_summary(
+        float(latest_ap["cost_basis_inr"].sum()),
+        float(latest_ap["market_value_inr"].sum()),
+        realized_pnl_summary(da.get_transactions(portfolio_id)),
+    )["pct_return"]
+
+    comparison = benchmark_comparison(
+        daily_returns, bench_returns, risk_free_rate_annual,
+        portfolio_cumulative_return_override=real_total_return,
+    )
     return BenchmarkResponse(portfolio_id=portfolio_id, benchmark_ticker="^NSEI", **comparison)
+
+
+def _find_stable_composition_window(portfolio_id: int) -> tuple[str, str] | None:
+    """Finds the widest real period with NO BUY/SELL activity for this
+    portfolio. The weight*return attribution identity below only holds
+    exactly when nothing was bought/sold mid-window -- otherwise the
+    portfolio's actual composition changed partway through, and
+    "start weights x period return" no longer equals what actually
+    happened (a real, non-negligible gap, not floating-point noise).
+
+    A hardcoded window ("2024-02-01" to "2024-05-31", picked for the
+    original 2-ticker demo's own specific trading history) is real bug
+    for any other upload: confirmed directly against a real 51-
+    transaction portfolio whose earliest trade (2024-04-18) postdates
+    that hardcoded window's own START date entirely, so no allocation
+    snapshot exists there at all (a 404, not even a reconciliation
+    mismatch) -- and even for a portfolio where both dates DID exist,
+    trading activity happening to fall inside that fixed window (also
+    confirmed real: an INFY.NS BUY landing inside it) breaks the
+    reconciliation identity outright (a real ~21 percentage-point gap
+    was observed this way, not a bug in the contribution math itself).
+
+    Returns (window_start, window_end) as ISO date strings -- the
+    widest gap between two consecutive real trade dates for this
+    portfolio -- or None if there are fewer than 2 trading days on
+    record (nothing to find a gap between).
+    """
+    tx = da.get_transactions(portfolio_id)
+    trade_dates = sorted(tx[tx["transaction_type"].isin(["BUY", "SELL"])]["txn_date"].dt.date.unique())
+    if len(trade_dates) < 2:
+        return None
+
+    best_gap_days = -1
+    best_start, best_end = None, None
+    for prev_date, next_date in zip(trade_dates, trade_dates[1:]):
+        gap_days = (next_date - prev_date).days
+        if gap_days > best_gap_days:
+            best_gap_days = gap_days
+            best_start, best_end = prev_date, next_date - timedelta(days=1)
+
+    if best_start is None or best_start >= best_end:
+        return None
+    return best_start.isoformat(), best_end.isoformat()
 
 
 @router.get("/{portfolio_id}/attribution", response_model=AttributionResponse)
 def get_attribution(portfolio_id: int, _: None = Depends(get_portfolio_or_404)) -> AttributionResponse:
-    # Same stable-composition window used in analytics/run_analytics_demo.py:
-    # the only period with no BUY/SELL activity, required for the
-    # weight*return reconciliation identity to hold (see that script's
-    # ATTRIBUTION section for the full reasoning).
-    window_start, window_end = "2024-02-01", "2024-05-31"
+    window = _find_stable_composition_window(portfolio_id)
+    if window is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no stable no-trading-activity window available for portfolio {portfolio_id} "
+                "(attribution needs at least 2 trading days with a gap between them to compute "
+                "a real weight x return reconciliation)"
+            ),
+        )
+    window_start, window_end = window
 
     alloc = da.get_allocation(portfolio_id)
     start_alloc = alloc[alloc["as_of_date"] == window_start]
